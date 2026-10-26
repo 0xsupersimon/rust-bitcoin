@@ -1,0 +1,49 @@
+name: 'Setup RBMT'
+description: 'Install cargo-rbmt, toolchains, and a no_std env for testing.'
+
+runs:
+  using: "composite"
+  steps:
+    - name: "Configure log level"
+      shell: bash
+      run: echo "RBMT_LOG_LEVEL=${{ runner.debug == '1' && 'verbose' || 'quiet' }}" >> "$GITHUB_ENV"
+
+    - name: "Read cargo-rbmt version"
+      id: rbmt-version
+      shell: bash
+      run: |
+        # Separate commands to force pipefail on error
+        version=$(cargo metadata --no-deps --format-version 1 | jq -er '.metadata.rbmt.version')
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: "Restore cargo-rbmt cache"
+      id: rbmt-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cargo/bin/cargo-rbmt
+        key: cargo-rbmt-${{ runner.os }}-${{ runner.arch }}-${{ steps.rbmt-version.outputs.version }}
+
+    - name: "Install cargo-rbmt"
+      if: steps.rbmt-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        cargo install \
+          --locked \
+          cargo-rbmt@$(grep "^rbmt.version" Cargo.toml | cut -d'"' -f2)
+
+    - name: "Save cargo-rbmt cache"
+      if: steps.rbmt-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cargo/bin/cargo-rbmt
+        key: ${{ steps.rbmt-cache.outputs.cache-primary-key }}
+
+    - name: "Install Rust toolchains via cargo-rbmt"
+      shell: bash
+      run: cargo rbmt toolchains
+
+    - name: "Install ARM cross-compiler"
+      shell: bash
+      run: |
+        sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi
+        echo "CC_thumbv7m_none_eabi=arm-none-eabi-gcc" >> $GITHUB_ENV

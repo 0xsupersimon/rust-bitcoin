@@ -1,30 +1,43 @@
 // SPDX-License-Identifier: CC0-1.0
 
+#[cfg(feature = "alloc")]
+#[cfg(feature = "hex")]
+use alloc::string::String;
+use core::marker::PhantomData;
 use core::ops::{
     Bound, Index, Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive,
 };
 
 #[cfg(feature = "arbitrary")]
 use arbitrary::{Arbitrary, Unstructured};
+use encoding::{Encode, PrefixedBytesEncoder};
 
-use super::ScriptBuf;
+use super::{ScriptBuf, P2A_PROGRAM};
+use crate::opcodes::all::{OP_CHECKSIG, OP_DUP, OP_EQUAL, OP_EQUALVERIFY, OP_HASH160, OP_RETURN};
+use crate::opcodes::{Opcode, OP_PUSHBYTES_2, OP_PUSHBYTES_20, OP_PUSHBYTES_32};
 use crate::prelude::{Box, ToOwned, Vec};
+use crate::script::{
+    Builder, RedeemScriptError, ScriptHash, ScriptHashableTag, WScriptHash, WitnessScriptSizeError,
+};
+use crate::witness_version::WitnessVersion;
+use crate::{ScriptPubKey, WitnessScript};
 
-internals::transparent_newtype! {
+// Defined in `REPO_DIR/include/newtype.rs`.
+crate::transparent_newtype! {
     /// Bitcoin script slice.
     ///
-    /// *[See also the `bitcoin::script` module](super).*
+    /// *[See also the `script` module](super).*
     ///
-    /// `Script` is a script slice, the most primitive script type. It's usually seen in its borrowed
+    /// [`Script`] is a script slice, the most primitive script type. It's usually seen in its borrowed
     /// form `&Script`. It is always encoded as a series of bytes representing the opcodes and data
     /// pushes.
     ///
     /// # Validity
     ///
-    /// `Script` does not have any validity invariants - it's essentially just a marked slice of
-    /// bytes. This is similar to [`Path`](std::path::Path) vs [`OsStr`](std::ffi::OsStr) where they
-    /// are trivially cast-able to each-other and `Path` doesn't guarantee being a usable FS path but
-    /// having a newtype still has value because of added methods, readability and basic type checking.
+    /// [`Script`] does not have any validity invariants - it's essentially just a marked slice of
+    /// bytes. This is similar to [`Path`] vs [`OsStr`] where they are trivially cast-able to each-other
+    /// and `Path` doesn't guarantee being a usable FS path but having a newtype still has value because
+    /// of added methods, readability and basic type checking.
     ///
     /// Although at least data pushes could be checked not to overflow the script, bad scripts are
     /// allowed to be in a transaction (outputs just become unspendable) and there even are such
@@ -34,8 +47,9 @@ internals::transparent_newtype! {
     ///
     /// Slicing is similar to how `str` works: some ranges may be incorrect and indexing by
     /// `usize` is not supported. However, as opposed to `std`, we have no way of checking
-    /// correctness without causing linear complexity so there are **no panics on invalid
-    /// ranges!** If you supply an invalid range, you'll get a garbled script.
+    /// correctness without causing linear complexity so there are **no panics on ranges that
+    /// are not at an instruction boundary!** If you supply such a range, you'll get a garbled
+    /// script. As with slices, a range that is out of bounds does panic.
     ///
     /// The range is considered valid if it's at a boundary of instruction. Care must be taken
     /// especially with push operations because you could get a reference to arbitrary
@@ -52,23 +66,27 @@ internals::transparent_newtype! {
     /// # Hexadecimal strings
     ///
     /// Scripts are consensus encoded with a length prefix and as a result of this in some places in
-    /// the eccosystem one will encounter hex strings that include the prefix while in other places
+    /// the ecosystem one will encounter hex strings that include the prefix while in other places
     /// the prefix is excluded. To support parsing and formatting scripts as hex we provide a bunch
     /// of different APIs and trait implementations. Please see [`examples/script.rs`] for a
     /// thorough example of all the APIs.
+    ///
+    /// [`examples/script.rs`]: <https://github.com/rust-bitcoin/rust-bitcoin/blob/master/bitcoin/examples/script.rs>
     ///
     /// # Bitcoin Core References
     ///
     /// * [CScript definition](https://github.com/bitcoin/bitcoin/blob/d492dc1cdaabdc52b0766bf4cba4bd73178325d0/src/script/script.h#L410)
     ///
+    /// [`Path`]: std::path::Path
+    /// [`OsStr`]: std::ffi::OsStr
     #[derive(PartialOrd, Ord, PartialEq, Eq, Hash)]
-    pub struct Script([u8]);
+    pub struct Script<T>(PhantomData<T>, [u8]);
 
-    impl Script {
-        /// Treat byte slice as `Script`
+    impl<T> Script<T> {
+        /// Treats a byte slice as a [`Script`].
         pub const fn from_bytes(bytes: &_) -> &Self;
 
-        /// Treat mutable byte slice as `Script`
+        /// Treats a mutable byte slice as a [`Script`].
         pub fn from_bytes_mut(bytes: &mut _) -> &mut Self;
 
         pub(crate) fn from_boxed_bytes(bytes: Box<_>) -> Box<Self>;
@@ -77,19 +95,27 @@ internals::transparent_newtype! {
     }
 }
 
-impl Default for &Script {
+impl<T: 'static> Default for &Script<T> {
     #[inline]
     fn default() -> Self { Script::new() }
 }
 
-impl ToOwned for Script {
-    type Owned = ScriptBuf;
+impl<T> ToOwned for Script<T> {
+    type Owned = ScriptBuf<T>;
 
     #[inline]
     fn to_owned(&self) -> Self::Owned { ScriptBuf::from_bytes(self.to_vec()) }
 }
 
-impl Script {
+#[cfg(feature = "alloc")]
+impl<T> Clone for Box<Script<T>> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Script::from_boxed_bytes(self.as_bytes().to_owned().into_boxed_slice())
+    }
+}
+
+impl<T> Script<T> {
     /// Constructs a new empty script.
     #[inline]
     pub const fn new() -> &'static Self { Self::from_bytes(&[]) }
@@ -98,13 +124,13 @@ impl Script {
     ///
     /// This is just the script bytes **not** consensus encoding (which includes a length prefix).
     #[inline]
-    pub const fn as_bytes(&self) -> &[u8] { &self.0 }
+    pub const fn as_bytes(&self) -> &[u8] { &self.1 }
 
     /// Returns the script data as a mutable byte slice.
     ///
     /// This is just the script bytes **not** consensus encoding (which includes a length prefix).
     #[inline]
-    pub fn as_mut_bytes(&mut self) -> &mut [u8] { &mut self.0 }
+    pub fn as_mut_bytes(&mut self) -> &mut [u8] { &mut self.1 }
 
     /// Returns a copy of the script data.
     ///
@@ -114,8 +140,37 @@ impl Script {
 
     /// Returns a copy of the script data.
     #[inline]
-    #[deprecated(since = "TBD", note = "use to_vec instead")]
+    #[deprecated(since = "0.101.0", note = "use to_vec instead")]
     pub fn to_bytes(&self) -> Vec<u8> { self.to_vec() }
+
+    /// Consensus encodes the script as lower-case hex.
+    ///
+    /// Consensus encoding includes a length prefix. To hex encode without the length prefix use
+    /// [`to_hex_string_no_length_prefix`].
+    ///
+    /// [`to_hex_string_no_length_prefix`]: Self::to_hex_string_no_length_prefix
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    pub fn to_hex_string_prefixed(&self) -> String {
+        use hex::{BytesToHexIter, Case};
+
+        let iter = encoding::EncoderByteIter::new(self.encoder());
+        BytesToHexIter::new(iter, Case::Lower).flatten().map(char::from).collect()
+    }
+
+    /// Encodes the script as lower-case hex.
+    ///
+    /// This is **not** consensus encoding. The returned hex string will not include the length
+    /// prefix. See [`to_hex_string_prefixed`].
+    ///
+    /// [`to_hex_string_prefixed`]: Self::to_hex_string_prefixed
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    pub fn to_hex_string_no_length_prefix(&self) -> String {
+        use hex::DisplayHex as _;
+
+        self.as_bytes().to_lower_hex_string()
+    }
 
     /// Returns the length in bytes of the script.
     #[inline]
@@ -125,10 +180,12 @@ impl Script {
     #[inline]
     pub const fn is_empty(&self) -> bool { self.as_bytes().is_empty() }
 
-    /// Converts a [`Box<Script>`](Box) into a [`ScriptBuf`] without copying or allocating.
+    /// Converts a [`Box<Script>`] into a [`ScriptBuf`] without copying or allocating.
+    ///
+    /// [`Box<Script>`]: Box
     #[must_use]
     #[inline]
-    pub fn into_script_buf(self: Box<Self>) -> ScriptBuf {
+    pub fn into_script_buf(self: Box<Self>) -> ScriptBuf<T> {
         let rw = Box::into_raw(self) as *mut [u8];
         // SAFETY: copied from `std`
         // The pointer was just created from a box without deallocating
@@ -137,10 +194,166 @@ impl Script {
         let inner = unsafe { Box::from_raw(rw) };
         ScriptBuf::from_bytes(Vec::from(inner))
     }
+
+    /// Gets the hex representation of this script.
+    ///
+    /// # Returns
+    ///
+    /// Just the script bytes in hexadecimal **not** consensus encoding of the script i.e., the
+    /// string will not include a length prefix.
+    #[cfg(feature = "hex")]
+    #[inline]
+    #[deprecated(since = "1.0.0-rc.0", note = "use `format!(\"{var:x}\")` instead")]
+    pub fn to_hex(&self) -> alloc::string::String { alloc::format!("{:x}", self) }
+
+    /// Constructs a new script builder
+    pub fn builder() -> Builder<T> { Builder::new() }
+
+    /// Returns witness version of the script, if any.
+    ///
+    /// # Returns
+    ///
+    /// The witness version if this script is found to conform to the SegWit rules:
+    ///
+    /// > A scriptPubKey (or redeemScript as defined in BIP-0016/P2SH) that consists of a 1-byte
+    /// > push opcode (for 0 to 16) followed by a data push between 2 and 40 bytes gets a new
+    /// > special meaning. The value of the first push is called the "version byte". The following
+    /// > byte vector pushed is called the "witness program".
+    #[inline]
+    pub fn witness_version(&self) -> Option<WitnessVersion>
+    where
+        T: ScriptHashableTag,
+    {
+        let script_len = self.len();
+        if !(4..=42).contains(&script_len) {
+            return None;
+        }
+
+        let ver_opcode = Opcode::from(self.as_bytes()[0]); // Version 0 or PUSHNUM_1-PUSHNUM_16
+        let push_opbyte = self.as_bytes()[1]; // Second byte push opcode 2-40 bytes
+
+        // If push_opbyte < OP_PUSHBYTES_2 || push_opbyte > OP_PUSHBYTES_40
+        if push_opbyte < 0x02 || push_opbyte > 0x28 {
+            return None;
+        }
+        // Check that the rest of the script has the correct size
+        if script_len - 2 != push_opbyte as usize {
+            return None;
+        }
+
+        WitnessVersion::try_from(ver_opcode).ok()
+    }
+
+    /// Checks whether a script pubkey is a P2WSH output.
+    #[inline]
+    pub fn is_p2wsh(&self) -> bool
+    where
+        T: ScriptHashableTag,
+    {
+        self.len() == 34
+            && self.witness_version() == Some(WitnessVersion::V0)
+            && self.as_bytes()[1] == OP_PUSHBYTES_32.to_u8()
+    }
+
+    /// Checks whether a script pubkey is a P2WPKH output.
+    #[inline]
+    pub fn is_p2wpkh(&self) -> bool
+    where
+        T: ScriptHashableTag,
+    {
+        self.len() == 22
+            && self.witness_version() == Some(WitnessVersion::V0)
+            && self.as_bytes()[1] == OP_PUSHBYTES_20.to_u8()
+    }
+}
+
+impl ScriptPubKey {
+    /// Checks whether a script pubkey is a Segregated Witness (SegWit) program.
+    #[inline]
+    pub fn is_witness_program(&self) -> bool { self.witness_version().is_some() }
+
+    /// Checks whether a script pubkey is a P2SH output.
+    #[inline]
+    pub fn is_p2sh(&self) -> bool {
+        self.len() == 23
+            && self.as_bytes()[0] == OP_HASH160.to_u8()
+            && self.as_bytes()[1] == OP_PUSHBYTES_20.to_u8()
+            && self.as_bytes()[22] == OP_EQUAL.to_u8()
+    }
+
+    /// Checks whether a script pubkey is a P2PKH output.
+    #[inline]
+    pub fn is_p2pkh(&self) -> bool {
+        self.len() == 25
+            && self.as_bytes()[0] == OP_DUP.to_u8()
+            && self.as_bytes()[1] == OP_HASH160.to_u8()
+            && self.as_bytes()[2] == OP_PUSHBYTES_20.to_u8()
+            && self.as_bytes()[23] == OP_EQUALVERIFY.to_u8()
+            && self.as_bytes()[24] == OP_CHECKSIG.to_u8()
+    }
+
+    /// Checks whether a script pubkey is a P2A output.
+    #[inline]
+    pub fn is_p2a(&self) -> bool {
+        self.len() == 4
+            && self.witness_version() == Some(WitnessVersion::V1)
+            && self.as_bytes()[1] == OP_PUSHBYTES_2.to_u8()
+            && self.as_bytes()[2..] == P2A_PROGRAM
+    }
+
+    /// Checks whether this is a consensus-valid `OP_RETURN` output.
+    ///
+    /// To validate if the `OP_RETURN` obeys Bitcoin Core's current standardness policy, use
+    /// `bitcoin::ScriptPubKeyExt::is_standard_op_return()` instead.
+    #[inline]
+    pub fn is_op_return(&self) -> bool {
+        self.as_bytes().first().is_some_and(|&b| b == OP_RETURN.to_u8())
+    }
+}
+
+impl WitnessScript {
+    /// Returns 256-bit hash of the script for P2WSH outputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the script exceeds 10,000 bytes.
+    #[inline]
+    pub fn wscript_hash(&self) -> Result<WScriptHash, WitnessScriptSizeError> {
+        WScriptHash::from_script(self)
+    }
+}
+
+impl<T: ScriptHashableTag> Script<T> {
+    /// Returns 160-bit hash of the script for P2SH outputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the script exceeds 520 bytes or is a SegWit version 1+ witness program.
+    #[inline]
+    pub fn script_hash(&self) -> Result<ScriptHash, RedeemScriptError> {
+        ScriptHash::from_script(self)
+    }
+}
+
+impl<T> Encode for Script<T> {
+    type Encoder<'e>
+        = ScriptEncoder<'e>
+    where
+        Self: 'e;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        ScriptEncoder::new(PrefixedBytesEncoder::new(self.as_bytes()))
+    }
+}
+
+encoding::encoder_newtype_exact! {
+    /// The encoder for the [`Script<T>`] type.
+    #[derive(Debug, Clone)]
+    pub struct ScriptEncoder<'e>(PrefixedBytesEncoder<'e>);
 }
 
 #[cfg(feature = "arbitrary")]
-impl<'a> Arbitrary<'a> for &'a Script {
+impl<'a, T> Arbitrary<'a> for &'a Script<T> {
     #[inline]
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
         let v = <&'a [u8]>::arbitrary(u)?;
@@ -152,10 +365,11 @@ macro_rules! delegate_index {
     ($($type:ty),* $(,)?) => {
         $(
             /// Script subslicing operation - read [slicing safety](#slicing-safety)!
-            impl Index<$type> for Script {
+            impl<T> Index<$type> for Script<T> {
                 type Output = Self;
 
                 #[inline]
+                #[track_caller]
                 fn index(&self, index: $type) -> &Self::Output {
                     Self::from_bytes(&self.as_bytes()[index])
                 }
@@ -173,62 +387,3 @@ delegate_index!(
     RangeToInclusive<usize>,
     (Bound<usize>, Bound<usize>)
 );
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn script_from_bytes() {
-        let script = Script::from_bytes(&[1, 2, 3]);
-        assert_eq!(script.as_bytes(), [1, 2, 3]);
-    }
-
-    #[test]
-    fn script_from_bytes_mut() {
-        let bytes = &mut [1, 2, 3];
-        let script = Script::from_bytes_mut(bytes);
-        script.as_mut_bytes()[0] = 4;
-        assert_eq!(script.as_mut_bytes(), [4, 2, 3]);
-    }
-
-    #[test]
-    fn script_to_vec() {
-        let script = Script::from_bytes(&[1, 2, 3]);
-        assert_eq!(script.to_vec(), vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn script_len() {
-        let script = Script::from_bytes(&[1, 2, 3]);
-        assert_eq!(script.len(), 3);
-    }
-
-    #[test]
-    fn script_is_empty() {
-        let script: &Script = Default::default();
-        assert!(script.is_empty());
-
-        let script = Script::from_bytes(&[1, 2, 3]);
-        assert!(!script.is_empty());
-    }
-
-    #[test]
-    fn script_to_owned() {
-        let script = Script::from_bytes(&[1, 2, 3]);
-        let script_buf = script.to_owned();
-        assert_eq!(script_buf.as_bytes(), [1, 2, 3]);
-    }
-
-    #[test]
-    fn test_index() {
-        let script = Script::from_bytes(&[1, 2, 3, 4, 5]);
-
-        assert_eq!(script[1..3].as_bytes(), &[2, 3]);
-        assert_eq!(script[2..].as_bytes(), &[3, 4, 5]);
-        assert_eq!(script[..3].as_bytes(), &[1, 2, 3]);
-        assert_eq!(script[..].as_bytes(), &[1, 2, 3, 4, 5]);
-        assert_eq!(script[1..=3].as_bytes(), &[2, 3, 4]);
-        assert_eq!(script[..=2].as_bytes(), &[1, 2, 3]);
-    }
-}

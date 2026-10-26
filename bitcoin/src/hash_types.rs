@@ -5,26 +5,26 @@
 //! This module is deprecated. You can find hash types in their respective, hopefully obvious, modules.
 
 #[deprecated(since = "TBD", note = "use `crate::T` instead")]
-pub use crate::bip158::{FilterHash, FilterHeader};
-#[deprecated(since = "TBD", note = "use `crate::T` instead")]
 pub use crate::{BlockHash, TxMerkleNode, Txid, WitnessCommitment, WitnessMerkleNode, Wtxid};
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+
     use super::*;
     use crate::key::{PubkeyHash, WPubkeyHash};
     use crate::script::{ScriptHash, WScriptHash};
     use crate::{LegacySighash, SegwitV0Sighash, TapSighash, XKeyIdentifier};
 
     #[rustfmt::skip]
-    /// sha256d of the empty string
+    /// SHA256d of the empty string
     const DUMMY32: [u8; 32] = [
         0x5d, 0xf6, 0xe0, 0xe2, 0x76, 0x13, 0x59, 0xd3,
         0x0a, 0x82, 0x75, 0x05, 0x8e, 0x29, 0x9f, 0xcc,
         0x03, 0x81, 0x53, 0x45, 0x45, 0xf5, 0x5c, 0xf4,
         0x3e, 0x41, 0x98, 0x3f, 0x5d, 0x4c, 0x94, 0x56,
     ];
-    /// hash160 of the empty string
+    /// HASH160 of the empty string
     #[rustfmt::skip]
     const DUMMY20: [u8; 20] = [
         0xb4, 0x72, 0xa2, 0x66, 0xd0, 0xbd, 0x89, 0xc1, 0x37, 0x06,
@@ -91,15 +91,6 @@ mod tests {
         assert_eq!(
             XKeyIdentifier::from_byte_array(DUMMY20).to_string(),
             "b472a266d0bd89c13706a4132ccfb16f7c3b9fcb",
-        );
-
-        assert_eq!(
-            FilterHash::from_byte_array(DUMMY32).to_string(),
-            "56944c5d3f98413ef45cf54545538103cc9f298e0575820ad3591376e2e0f65d",
-        );
-        assert_eq!(
-            FilterHeader::from_byte_array(DUMMY32).to_string(),
-            "56944c5d3f98413ef45cf54545538103cc9f298e0575820ad3591376e2e0f65d",
         );
     }
 }

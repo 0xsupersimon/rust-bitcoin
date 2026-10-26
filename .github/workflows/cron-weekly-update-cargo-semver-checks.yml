@@ -3,18 +3,24 @@ on:
   schedule:
     - cron: "0 0 * * 6" # runs every Saturday at 00:00
   workflow_dispatch: # allows manual triggering
+permissions: {}
 jobs:
   format:
     name: Update cargo-semver-checks
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Update semver-checks to use latest crates.io published version
         run: |
           set -x
           # Grab the latest version of cargo semver-checks from crates.io
           # that is not yanked.
-          LATEST_VERSION=$(curl --proto '=https' --tlsv1.3 -sSf https://crates.io/api/v1/crates/cargo-semver-checks/versions | jq -r 'first( .versions[] | select(.yanked == false) ) | .num')
+          LATEST_VERSION=$(curl --proto '=https' --tlsv1.3 -sSf -H "User-Agent: rust-bitcoin-ci" https://crates.io/api/v1/crates/cargo-semver-checks/versions | jq -r 'first( .versions[] | select(.yanked == false) ) | .num')
           # Update the latest version in the reference file.
           echo "${LATEST_VERSION}" > ./.github/workflows/cargo-semver-checks-version
           echo "cargo_semver_checks_version=${LATEST_VERSION}" >> $GITHUB_ENV
@@ -28,7 +34,7 @@ jobs:
           fi
       - name: Create Pull Request
         if: env.changes_made == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           token: ${{ secrets.APOELSTRA_CREATE_PR_TOKEN }}
           author: Update cargo-semver-checks Bot <bot@example.com>

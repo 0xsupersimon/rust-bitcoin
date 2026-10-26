@@ -23,48 +23,50 @@
 //! }
 //! ```
 
-use core::convert::Infallible;
-use core::fmt;
+#[doc(no_inline)]
+pub use self::error::OverflowError;
 
 pub mod as_sat_per_kwu_floor {
     //! Serialize and deserialize [`FeeRate`] denominated in satoshis per 1000 weight units.
     //!
-    //! Use with `#[serde(with = "fee_rate::serde::as_sat_per_kwu")]`.
+    //! Use with `#[serde(with = "fee_rate::serde::as_sat_per_kwu_floor")]`.
 
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    use crate::{Amount, FeeRate};
+    use crate::FeeRate;
 
+    #[inline]
     pub fn serialize<S: Serializer>(f: &FeeRate, s: S) -> Result<S::Ok, S::Error> {
         u64::serialize(&f.to_sat_per_kwu_floor(), s)
     }
 
+    #[inline]
     pub fn deserialize<'d, D: Deserializer<'d>>(d: D) -> Result<FeeRate, D::Error> {
-        let sat = u64::deserialize(d)?;
-        FeeRate::from_per_kwu(
-            Amount::from_sat(sat).map_err(|_| serde::de::Error::custom("amount out of range"))?,
-        )
-        .into_result()
-        .map_err(|_| serde::de::Error::custom("fee rate too big for sats/kwu"))
+        use crate::serde::de::Error;
+
+        let sat_per_kwu = u64::deserialize(d)?;
+        FeeRate::from_sat_per_kwu(sat_per_kwu).into_result().map_err(|_| {
+            let unexpected = serde::de::Unexpected::Unsigned(sat_per_kwu);
+            let expected = &"non-negative integer up to 4611686018427387";
+            D::Error::invalid_value(unexpected, expected)
+        })
     }
 
     pub mod opt {
         //! Serialize and deserialize [`Option<FeeRate>`] denominated in satoshis per 1000 weight units.
         //!
-        //! Use with `#[serde(with = "fee_rate::serde::as_sat_per_kwu::opt")]`.
+        //! Use with `#[serde(with = "fee_rate::serde::as_sat_per_kwu_floor::opt")]`.
 
         use core::fmt;
 
-        use serde::{de, Deserializer, Serializer};
+        use serde::{de, Deserializer, Serialize, Serializer};
 
         use crate::FeeRate;
 
+        #[inline]
         #[allow(clippy::ref_option)] // API forced by serde.
         pub fn serialize<S: Serializer>(f: &Option<FeeRate>, s: S) -> Result<S::Ok, S::Error> {
-            match *f {
-                Some(f) => s.serialize_some(&f.to_sat_per_kwu_floor()),
-                None => s.serialize_none(),
-            }
+            f.map(FeeRate::to_sat_per_kwu_floor).serialize(s)
         }
 
         pub fn deserialize<'d, D: Deserializer<'d>>(d: D) -> Result<Option<FeeRate>, D::Error> {
@@ -77,6 +79,7 @@ pub mod as_sat_per_kwu_floor {
                     write!(f, "an Option<u64>")
                 }
 
+                #[inline]
                 fn visit_none<E>(self) -> Result<Self::Value, E>
                 where
                     E: de::Error,
@@ -84,6 +87,7 @@ pub mod as_sat_per_kwu_floor {
                     Ok(None)
                 }
 
+                #[inline]
                 fn visit_some<D>(self, d: D) -> Result<Self::Value, D::Error>
                 where
                     D: Deserializer<'de>,
@@ -92,6 +96,58 @@ pub mod as_sat_per_kwu_floor {
                 }
             }
             d.deserialize_option(VisitOpt)
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    pub mod vec {
+        //! Serialize and deserialize [`Vec<FeeRate>`] denominated in satoshis per 1000 weight units.
+        //!
+        //! Use with `#[serde(with = "fee_rate::serde::as_sat_per_kwu_floor::vec")]`.
+
+        use alloc::vec::Vec;
+        use core::fmt;
+
+        use serde::de::{self, SeqAccess};
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        use crate::FeeRate;
+
+        #[inline]
+        pub fn serialize<S: Serializer>(f: &[FeeRate], s: S) -> Result<S::Ok, S::Error> {
+            s.collect_seq(f.iter().map(|rate| rate.to_sat_per_kwu_floor()))
+        }
+
+        // Errors on overflow.
+        pub fn deserialize<'d, D: Deserializer<'d>>(d: D) -> Result<Vec<FeeRate>, D::Error> {
+            struct VisitVec;
+
+            impl<'de> de::Visitor<'de> for VisitVec {
+                type Value = Vec<FeeRate>;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    write!(f, "a sequence of u64")
+                }
+
+                fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                where
+                    A: SeqAccess<'de>,
+                {
+                    #[derive(Deserialize)]
+                    #[serde(transparent)]
+                    struct Wrapper(#[serde(with = "super")] FeeRate);
+
+                    let mut out = Vec::with_capacity(
+                        internals::serde::cautious_size_hint::<FeeRate>(seq.size_hint()),
+                    );
+                    while let Some(wrapped) = seq.next_element::<Wrapper>()? {
+                        out.push(wrapped.0);
+                    }
+                    Ok(out)
+                }
+            }
+
+            d.deserialize_seq(VisitVec)
         }
     }
 }
@@ -106,11 +162,13 @@ pub mod as_sat_per_vb_floor {
 
     use crate::{Amount, FeeRate};
 
+    #[inline]
     pub fn serialize<S: Serializer>(f: &FeeRate, s: S) -> Result<S::Ok, S::Error> {
         u64::serialize(&f.to_sat_per_vb_floor(), s)
     }
 
     // Errors on overflow.
+    #[inline]
     pub fn deserialize<'d, D: Deserializer<'d>>(d: D) -> Result<FeeRate, D::Error> {
         let sat = u64::deserialize(d)?;
         FeeRate::from_per_vb(
@@ -128,16 +186,14 @@ pub mod as_sat_per_vb_floor {
 
         use core::fmt;
 
-        use serde::{de, Deserializer, Serializer};
+        use serde::{de, Deserializer, Serialize, Serializer};
 
         use crate::fee_rate::FeeRate;
 
+        #[inline]
         #[allow(clippy::ref_option)] // API forced by serde.
         pub fn serialize<S: Serializer>(f: &Option<FeeRate>, s: S) -> Result<S::Ok, S::Error> {
-            match *f {
-                Some(f) => s.serialize_some(&f.to_sat_per_vb_floor()),
-                None => s.serialize_none(),
-            }
+            f.map(FeeRate::to_sat_per_vb_floor).serialize(s)
         }
 
         pub fn deserialize<'d, D: Deserializer<'d>>(d: D) -> Result<Option<FeeRate>, D::Error> {
@@ -150,6 +206,7 @@ pub mod as_sat_per_vb_floor {
                     write!(f, "an Option<u64>")
                 }
 
+                #[inline]
                 fn visit_none<E>(self) -> Result<Self::Value, E>
                 where
                     E: de::Error,
@@ -157,6 +214,7 @@ pub mod as_sat_per_vb_floor {
                     Ok(None)
                 }
 
+                #[inline]
                 fn visit_some<D>(self, d: D) -> Result<Self::Value, D::Error>
                 where
                     D: Deserializer<'de>,
@@ -165,6 +223,59 @@ pub mod as_sat_per_vb_floor {
                 }
             }
             d.deserialize_option(VisitOpt)
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    pub mod vec {
+        //! Serialize and deserialize [`Vec<FeeRate>`] denominated in satoshis per virtual byte.
+        //!
+        //! When serializing use floor division to convert per kwu to per virtual byte.
+        //! Use with `#[serde(with = "fee_rate::serde::as_sat_per_vb_floor::vec")]`.
+
+        use alloc::vec::Vec;
+        use core::fmt;
+
+        use serde::de::{self, SeqAccess};
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        use crate::FeeRate;
+
+        #[inline]
+        pub fn serialize<S: Serializer>(f: &[FeeRate], s: S) -> Result<S::Ok, S::Error> {
+            s.collect_seq(f.iter().map(|rate| rate.to_sat_per_vb_floor()))
+        }
+
+        // Errors on overflow.
+        pub fn deserialize<'d, D: Deserializer<'d>>(d: D) -> Result<Vec<FeeRate>, D::Error> {
+            struct VisitVec;
+
+            impl<'de> de::Visitor<'de> for VisitVec {
+                type Value = Vec<FeeRate>;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    write!(f, "a sequence of u64")
+                }
+
+                fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                where
+                    A: SeqAccess<'de>,
+                {
+                    #[derive(Deserialize)]
+                    #[serde(transparent)]
+                    struct Wrapper(#[serde(with = "super")] FeeRate);
+
+                    let mut out = Vec::with_capacity(
+                        internals::serde::cautious_size_hint::<FeeRate>(seq.size_hint()),
+                    );
+                    while let Some(wrapped) = seq.next_element::<Wrapper>()? {
+                        out.push(wrapped.0);
+                    }
+                    Ok(out)
+                }
+            }
+
+            d.deserialize_seq(VisitVec)
         }
     }
 }
@@ -179,11 +290,13 @@ pub mod as_sat_per_vb_ceil {
 
     use crate::{Amount, FeeRate};
 
+    #[inline]
     pub fn serialize<S: Serializer>(f: &FeeRate, s: S) -> Result<S::Ok, S::Error> {
         u64::serialize(&f.to_sat_per_vb_ceil(), s)
     }
 
     // Errors on overflow.
+    #[inline]
     pub fn deserialize<'d, D: Deserializer<'d>>(d: D) -> Result<FeeRate, D::Error> {
         let sat = u64::deserialize(d)?;
         FeeRate::from_per_vb(
@@ -201,16 +314,14 @@ pub mod as_sat_per_vb_ceil {
 
         use core::fmt;
 
-        use serde::{de, Deserializer, Serializer};
+        use serde::{de, Deserializer, Serialize, Serializer};
 
         use crate::fee_rate::FeeRate;
 
+        #[inline]
         #[allow(clippy::ref_option)] // API forced by serde.
         pub fn serialize<S: Serializer>(f: &Option<FeeRate>, s: S) -> Result<S::Ok, S::Error> {
-            match *f {
-                Some(f) => s.serialize_some(&f.to_sat_per_vb_ceil()),
-                None => s.serialize_none(),
-            }
+            f.map(FeeRate::to_sat_per_vb_ceil).serialize(s)
         }
 
         pub fn deserialize<'d, D: Deserializer<'d>>(d: D) -> Result<Option<FeeRate>, D::Error> {
@@ -223,6 +334,7 @@ pub mod as_sat_per_vb_ceil {
                     write!(f, "an Option<u64>")
                 }
 
+                #[inline]
                 fn visit_none<E>(self) -> Result<Self::Value, E>
                 where
                     E: de::Error,
@@ -230,6 +342,7 @@ pub mod as_sat_per_vb_ceil {
                     Ok(None)
                 }
 
+                #[inline]
                 fn visit_some<D>(self, d: D) -> Result<Self::Value, D::Error>
                 where
                     D: Deserializer<'de>,
@@ -240,22 +353,89 @@ pub mod as_sat_per_vb_ceil {
             d.deserialize_option(VisitOpt)
         }
     }
-}
 
-/// Overflow occurred while deserializing fee rate per virtual byte.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct OverflowError;
+    #[cfg(feature = "alloc")]
+    pub mod vec {
+        //! Serialize and deserialize [`Vec<FeeRate>`] denominated in satoshis per virtual byte.
+        //!
+        //! When serializing use ceil division to convert per kwu to per virtual byte.
+        //! Use with `#[serde(with = "fee_rate::serde::as_sat_per_vb_ceil::vec")]`.
 
-impl From<Infallible> for OverflowError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
+        use alloc::vec::Vec;
+        use core::fmt;
 
-impl fmt::Display for OverflowError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "overflow occurred while deserializing fee rate per virtual byte")
+        use serde::de::{self, SeqAccess};
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        use crate::FeeRate;
+
+        #[inline]
+        pub fn serialize<S: Serializer>(f: &[FeeRate], s: S) -> Result<S::Ok, S::Error> {
+            s.collect_seq(f.iter().map(|rate| rate.to_sat_per_vb_ceil()))
+        }
+
+        // Errors on overflow.
+        pub fn deserialize<'d, D: Deserializer<'d>>(d: D) -> Result<Vec<FeeRate>, D::Error> {
+            struct VisitVec;
+
+            impl<'de> de::Visitor<'de> for VisitVec {
+                type Value = Vec<FeeRate>;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    write!(f, "a sequence of u64")
+                }
+
+                fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                where
+                    A: SeqAccess<'de>,
+                {
+                    #[derive(Deserialize)]
+                    #[serde(transparent)]
+                    struct Wrapper(#[serde(with = "super")] FeeRate);
+
+                    let mut out = Vec::with_capacity(
+                        internals::serde::cautious_size_hint::<FeeRate>(seq.size_hint()),
+                    );
+                    while let Some(wrapped) = seq.next_element::<Wrapper>()? {
+                        out.push(wrapped.0);
+                    }
+                    Ok(out)
+                }
+            }
+
+            d.deserialize_seq(VisitVec)
+        }
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for OverflowError {}
+/// Error types for fee rate serde handling.
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
+
+    /// Overflow occurred while deserializing fee rate per virtual byte.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct OverflowError;
+
+    impl From<Infallible> for OverflowError {
+        #[inline]
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for OverflowError {
+        #[inline]
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "overflow occurred while deserializing fee rate per virtual byte")
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for OverflowError {
+        #[inline]
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            let Self {} = self;
+            None
+        }
+    }
+}

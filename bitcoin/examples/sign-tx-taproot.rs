@@ -2,15 +2,13 @@
 
 //! Demonstrate creating a transaction that spends to and from p2tr outputs.
 
-use bitcoin::key::{Keypair, TapTweak, TweakedKeypair, UntweakedPublicKey};
+use bitcoin::ext::*;
+use bitcoin::key::{Keypair, PrivateKey, TapTweak, TweakedKeypair, UntweakedPublicKey};
 use bitcoin::locktime::absolute;
-use bitcoin::script::ScriptBufExt as _;
-use bitcoin::secp256k1::{rand, Message, Secp256k1, SecretKey, Signing, Verification};
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
-use bitcoin::witness::WitnessExt as _;
 use bitcoin::{
-    transaction, Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
-    Txid, Witness,
+    transaction, Address, AddressParams, Amount, OutPoint, ScriptPubKeyBuf, ScriptSigBuf, Sequence,
+    Transaction, TxIn, TxOut, Txid, Witness,
 };
 
 const DUMMY_UTXO_AMOUNT: Amount = Amount::from_sat_u32(20_000_000);
@@ -18,15 +16,13 @@ const SPEND_AMOUNT: Amount = Amount::from_sat_u32(5_000_000);
 const CHANGE_AMOUNT: Amount = Amount::from_sat_u32(14_999_000); // 1000 sat fee.
 
 fn main() {
-    let secp = Secp256k1::new();
-
     // Get a keypair we control. In a real application these would come from a stored secret.
-    let keypair = senders_keys(&secp);
-    let (internal_key, _parity) = keypair.x_only_public_key();
+    let keypair = senders_keys();
+    let internal_key = keypair.to_x_only_public_key();
 
     // Get an unspent output that is locked to the key above that we control.
     // In a real application these would come from the chain.
-    let (dummy_out_point, dummy_utxo) = dummy_unspent_transaction_output(&secp, internal_key);
+    let (dummy_out_point, dummy_utxo) = dummy_unspent_transaction_output(internal_key);
 
     // Get an address to send to.
     let address = receivers_address();
@@ -34,26 +30,26 @@ fn main() {
     // The input for the transaction we are constructing.
     let input = TxIn {
         previous_output: dummy_out_point, // The dummy output we are spending.
-        script_sig: ScriptBuf::default(), // For a p2tr script_sig is empty.
+        script_sig: ScriptSigBuf::default(), // For a p2tr script_sig is empty.
         sequence: Sequence::ENABLE_LOCKTIME_AND_RBF,
         witness: Witness::default(), // Filled in after signing.
     };
 
     // The spend output is locked to a key controlled by the receiver.
-    let spend = TxOut { value: SPEND_AMOUNT, script_pubkey: address.script_pubkey() };
+    let spend = TxOut { amount: SPEND_AMOUNT, script_pubkey: address.script_pubkey() };
 
     // The change output is locked to a key controlled by us.
     let change = TxOut {
-        value: CHANGE_AMOUNT,
-        script_pubkey: ScriptBuf::new_p2tr(&secp, internal_key, None), // Change comes back to us.
+        amount: CHANGE_AMOUNT,
+        script_pubkey: ScriptPubKeyBuf::new_p2tr(internal_key, None), // Change comes back to us.
     };
 
     // The transaction we want to sign and broadcast.
     let mut unsigned_tx = Transaction {
-        version: transaction::Version::TWO,  // Post BIP-68.
+        version: transaction::Version::TWO,  // Post BIP-0068.
         lock_time: absolute::LockTime::ZERO, // Ignore the locktime.
-        input: vec![input],                  // Input goes into index 0.
-        output: vec![spend, change],         // Outputs, order does not matter.
+        inputs: vec![input],                 // Input goes into index 0.
+        outputs: vec![spend, change],        // Outputs, order does not matter.
     };
     let input_index = 0;
 
@@ -68,13 +64,9 @@ fn main() {
         .taproot_key_spend_signature_hash(input_index, &prevouts, sighash_type)
         .expect("failed to construct sighash");
 
-    // Sign the sighash using the secp256k1 library (exported by rust-bitcoin).
-    let tweaked: TweakedKeypair = keypair.tap_tweak(&secp, None);
-    let msg = Message::from(sighash);
-    let signature = secp.sign_schnorr(msg.as_ref(), tweaked.as_keypair());
-
-    // Update the witness stack.
-    let signature = bitcoin::taproot::Signature { signature, sighash_type };
+    // Sign the sighash and update the witness stack.
+    let tweaked: TweakedKeypair = keypair.tap_tweak(None);
+    let signature = sighash.sign_key_spend(&tweaked, sighash_type);
     *sighasher.witness_mut(input_index).unwrap() = Witness::p2tr_key_spend(&signature);
 
     // Get the signed transaction.
@@ -87,9 +79,9 @@ fn main() {
 /// An example of keys controlled by the transaction sender.
 ///
 /// In a real application these would be actual secrets.
-fn senders_keys<C: Signing>(secp: &Secp256k1<C>) -> Keypair {
-    let sk = SecretKey::new(&mut rand::thread_rng());
-    Keypair::from_secret_key(secp, &sk)
+fn senders_keys() -> Keypair {
+    let sk = PrivateKey::generate();
+    Keypair::from_private_key(&sk)
 }
 
 /// A dummy address for the receiver.
@@ -101,31 +93,30 @@ fn receivers_address() -> Address {
     "bc1p0dq0tzg2r780hldthn5mrznmpxsxc0jux5f20fwj0z3wqxxk6fpqm7q0va"
         .parse::<Address<_>>()
         .expect("a valid address")
-        .require_network(Network::Bitcoin)
+        .require_network(AddressParams::MAINNET)
         .expect("valid address for mainnet")
 }
 
-/// Constructs a new p2wpkh output locked to the key associated with `wpkh`.
+/// Constructs a new p2tr output locked to the key associated with `internal_key`.
 ///
 /// An utxo is described by the `OutPoint` (txid and index within the transaction that it was
 /// created). Using the out point one can get the transaction by `txid` and using the `vout` get the
-/// transaction value and script pubkey (`TxOut`) of the utxo.
+/// transaction amount and script pubkey (`TxOut`) of the utxo.
 ///
 /// This output is locked to keys that we control, in a real application this would be a valid
 /// output taken from a transaction that appears in the chain.
-fn dummy_unspent_transaction_output<C: Verification, K: Into<UntweakedPublicKey>>(
-    secp: &Secp256k1<C>,
+fn dummy_unspent_transaction_output<K: Into<UntweakedPublicKey>>(
     internal_key: K,
 ) -> (OutPoint, TxOut) {
     let internal_key = internal_key.into();
-    let script_pubkey = ScriptBuf::new_p2tr(secp, internal_key, None);
+    let script_pubkey = ScriptPubKeyBuf::new_p2tr(internal_key, None);
 
     let out_point = OutPoint {
         txid: Txid::from_byte_array([0xFF; 32]), // Arbitrary invalid dummy value.
         vout: 0,
     };
 
-    let utxo = TxOut { value: DUMMY_UTXO_AMOUNT, script_pubkey };
+    let utxo = TxOut { amount: DUMMY_UTXO_AMOUNT, script_pubkey };
 
     (out_point, utxo)
 }

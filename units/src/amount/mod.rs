@@ -2,14 +2,49 @@
 
 //! Bitcoin amounts.
 //!
-//! This module mainly introduces the [`Amount`] and [`SignedAmount`] types.
-//! We refer to the documentation on the types for more information.
+//! This module mainly introduces the [`Amount`] and [`SignedAmount`] types to express the bitcoin
+//! amounts supporting arithmetic, conversions between denominations and other important
+//! operations.
+//!
+//! # The 21M limit
+//!
+//! Since Bitcoin itself is limited to 2 100 000 000 000 000 satoshis (a bit less in practice)
+//! this type also implements the same restriction. While this may be surprising it actually
+//! provides many benefits:
+//!
+//! * Conversions from unsigned to signed are infallible.
+//! * Negation is infallible.
+//! * Absolute value is infallible (though `unsigned_abs` is usually better anyway).
+//! * Conversion to float is lossless.
+//! * Division cannot overflow, so a division error has to be div-by-zero; thus division by
+//!   `NonZeroU64` is completely infallible.
+//! * Infallible conversion to `i64` allows directly storing in SQL databases.
+//! * It's possible to more efficiently sum amounts using SIMD (currently unimplemented in the
+//!   library).
+//! * Subtraction of unsigned amounts producing a signed amount is infallible.
+//! * Conversion to msat is infallible.
+//!
+//! Note that the signed type also restricts the minimum to -21M BTC.
+//!
+//! While it might seem that this comes at a cost of littering the code with range checks it is not
+//! actually that bad because if the limit was not 21M btc it would've still been `u64::MAX` and
+//! require effectively the same kind of handling. This library exposes range checks as if they were
+//! overflow checks, so the calling code looks the same.
+//!
+//! Additionally, whenever an amount enters the program from outside, it already needs to be parsed
+//! or decoded, so the only thing this changes about it is the error type.
+//!
+//! # Numeric operations
+//!
+//! The types implement several arithmetic operations from [`core::ops`].
+//! To prevent errors due to an overflow or division by zero when using these operations, they
+//! return the [`NumOpResult`] type which enforces checked arithmetic. The resulting type itself
+//! implements the traits so you can write code like `a + b + c` and only check the result at the
+//! end.
+//!
+//! [`NumOpResult`]: super::NumOpResult
 
-mod error;
-mod result;
-#[cfg(feature = "serde")]
-pub mod serde;
-
+mod ops;
 mod signed;
 #[cfg(test)]
 mod tests;
@@ -17,28 +52,38 @@ mod unsigned;
 #[cfg(kani)]
 mod verification;
 
+pub mod error;
+#[cfg(feature = "serde")]
+pub mod serde;
+
 use core::cmp::Ordering;
 use core::convert::Infallible;
-use core::fmt;
+use core::fmt::{self, Write as _};
 use core::str::FromStr;
 
 #[cfg(feature = "arbitrary")]
 use arbitrary::{Arbitrary, Unstructured};
 
 use self::error::{MissingDigitsKind, ParseAmountErrorInner, ParseErrorInner};
-use crate::CheckedSum;
 
 #[rustfmt::skip]                // Keep public re-exports separate.
 #[doc(inline)]
 pub use self::{
-    error::{
-        InputTooLargeError, InvalidCharacterError, MissingDenominationError, MissingDigitsError,
-        OutOfRangeError, ParseAmountError, ParseDenominationError, ParseError,
-        PossiblyConfusingDenominationError, TooPreciseError, UnknownDenominationError,
-    },
     signed::SignedAmount,
     unsigned::Amount,
 };
+#[cfg(feature = "encoding")]
+#[doc(no_inline)]
+pub use self::error::AmountDecoderError;
+#[doc(no_inline)]
+pub use self::error::{
+    BadPositionError, InvalidCharacterError, MissingDenominationError, MissingDigitsError,
+    OutOfRangeError, ParseAmountError, ParseDenominationError, ParseError,
+    PossiblyConfusingDenominationError, TooPreciseError, UnknownDenominationError,
+};
+#[doc(inline)]
+#[cfg(feature = "encoding")]
+pub use self::unsigned::{AmountDecoder, AmountEncoder};
 
 /// A set of denominations in which amounts can be expressed.
 ///
@@ -99,65 +144,70 @@ pub enum Denomination {
 }
 
 impl Denomination {
-    /// Convenience alias for `Denomination::Bitcoin`.
-    pub const BTC: Self = Denomination::Bitcoin;
+    /// Convenience alias for [`Denomination::Bitcoin`].
+    pub const BTC: Self = Self::Bitcoin;
 
-    /// Convenience alias for `Denomination::Satoshi`.
-    pub const SAT: Self = Denomination::Satoshi;
+    /// Convenience alias for [`Denomination::Satoshi`].
+    pub const SAT: Self = Self::Satoshi;
 
     /// The number of decimal places more than a satoshi.
+    #[inline]
     fn precision(self) -> i8 {
         match self {
-            Denomination::Bitcoin => -8,
-            Denomination::CentiBitcoin => -6,
-            Denomination::MilliBitcoin => -5,
-            Denomination::MicroBitcoin => -2,
-            Denomination::Bit => -2,
-            Denomination::Satoshi => 0,
-            Denomination::_DoNotUse(infallible) => match infallible {},
+            Self::Bitcoin => -8,
+            Self::CentiBitcoin => -6,
+            Self::MilliBitcoin => -5,
+            Self::MicroBitcoin => -2,
+            Self::Bit => -2,
+            Self::Satoshi => 0,
+            Self::_DoNotUse(infallible) => match infallible {},
         }
     }
 
     /// Returns a string representation of this denomination.
+    #[inline]
     fn as_str(self) -> &'static str {
         match self {
-            Denomination::Bitcoin => "BTC",
-            Denomination::CentiBitcoin => "cBTC",
-            Denomination::MilliBitcoin => "mBTC",
-            Denomination::MicroBitcoin => "uBTC",
-            Denomination::Bit => "bits",
-            Denomination::Satoshi => "satoshi",
-            Denomination::_DoNotUse(infallible) => match infallible {},
+            Self::Bitcoin => "BTC",
+            Self::CentiBitcoin => "cBTC",
+            Self::MilliBitcoin => "mBTC",
+            Self::MicroBitcoin => "uBTC",
+            Self::Bit => "bits",
+            Self::Satoshi => "satoshi",
+            Self::_DoNotUse(infallible) => match infallible {},
         }
     }
 
-    /// The different `str` forms of denominations that are recognized.
+    /// The different [`str`] forms of denominations that are recognized.
+    #[inline]
     fn forms(s: &str) -> Option<Self> {
         match s {
-            "BTC" | "btc" => Some(Denomination::Bitcoin),
-            "cBTC" | "cbtc" => Some(Denomination::CentiBitcoin),
-            "mBTC" | "mbtc" => Some(Denomination::MilliBitcoin),
-            "uBTC" | "ubtc" | "µBTC" | "µbtc" => Some(Denomination::MicroBitcoin),
-            "bit" | "bits" | "BIT" | "BITS" => Some(Denomination::Bit),
+            "BTC" | "btc" => Some(Self::Bitcoin),
+            "cBTC" | "cbtc" => Some(Self::CentiBitcoin),
+            "mBTC" | "mbtc" => Some(Self::MilliBitcoin),
+            "uBTC" | "ubtc" | "µBTC" | "µbtc" => Some(Self::MicroBitcoin),
+            "bit" | "bits" | "BIT" | "BITS" => Some(Self::Bit),
             "SATOSHI" | "satoshi" | "SATOSHIS" | "satoshis" | "SAT" | "sat" | "SATS" | "sats" =>
-                Some(Denomination::Satoshi),
+                Some(Self::Satoshi),
             _ => None,
         }
     }
 }
 
-/// These form are ambiguous and could have many meanings.  For example, M could denote Mega or Milli.
-/// If any of these forms are used, an error type `PossiblyConfusingDenomination` is returned.
+/// These forms are ambiguous and could have many meanings. For example, M could denote Mega or Milli.
+/// If any of these forms are used, an error type [`PossiblyConfusingDenominationError`] is
+/// returned.
 const CONFUSING_FORMS: [&str; 6] = ["CBTC", "Cbtc", "MBTC", "Mbtc", "UBTC", "Ubtc"];
 
 impl fmt::Display for Denomination {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str(self.as_str()) }
 }
 
 impl FromStr for Denomination {
     type Err = ParseDenominationError;
 
-    /// Converts from a `str` to a `Denomination`.
+    /// Converts from a [`str`] to a [`Denomination`].
     ///
     /// # Errors
     ///
@@ -168,18 +218,20 @@ impl FromStr for Denomination {
         use self::ParseDenominationError as E;
 
         if CONFUSING_FORMS.contains(&s) {
-            return Err(E::PossiblyConfusing(PossiblyConfusingDenominationError(s.into())));
-        };
+            return Err(PossiblyConfusingDenominationError(s.into())).map_err(E::PossiblyConfusing);
+        }
 
-        let form = self::Denomination::forms(s);
+        let form = Self::forms(s);
 
         form.ok_or_else(|| E::Unknown(UnknownDenominationError(s.into())))
     }
 }
 
-/// Returns `Some(position)` if the precision is not supported.
+/// Returns [`Some(position)`] if the precision is not supported.
 ///
 /// The position indicates the first digit that is too precise.
+///
+/// [`Some(position)`]: Some
 fn is_too_precise(s: &str, precision: usize) -> Option<usize> {
     match s.find('.') {
         Some(pos) if precision >= pos => Some(0),
@@ -197,33 +249,44 @@ fn is_too_precise(s: &str, precision: usize) -> Option<usize> {
     }
 }
 
-const INPUT_STRING_LEN_LIMIT: usize = 50;
-
 /// Parses a decimal string in the given denomination into a satoshi value and a
 /// [`bool`] indicator for a negative amount.
 ///
-/// The `bool` is only needed to distinguish -0 from 0.
+/// The [`bool`] is only needed to distinguish -0 from 0.
+#[allow(clippy::too_many_lines)]
 fn parse_signed_to_satoshi(
     mut s: &str,
     denom: Denomination,
 ) -> Result<(bool, SignedAmount), InnerParseError> {
-    if s.is_empty() {
-        return Err(InnerParseError::MissingDigits(MissingDigitsError {
-            kind: MissingDigitsKind::Empty,
-        }));
+    /// The previously parsed character, used to validate the position of underscores.
+    #[derive(Clone, Copy)]
+    enum PrevChar {
+        Digit,
+        Underscore,
+        Dot,
     }
-    if s.len() > INPUT_STRING_LEN_LIMIT {
-        return Err(InnerParseError::InputTooLarge(s.len()));
+
+    if s.is_empty() {
+        return Err(MissingDigitsError { kind: MissingDigitsKind::Empty })
+            .map_err(InnerParseError::MissingDigits);
     }
 
     let is_negative = s.starts_with('-');
     if is_negative {
         if s.len() == 1 {
-            return Err(InnerParseError::MissingDigits(MissingDigitsError {
-                kind: MissingDigitsKind::OnlyMinusSign,
-            }));
+            return Err(MissingDigitsError { kind: MissingDigitsKind::OnlyMinusSign })
+                .map_err(InnerParseError::MissingDigits);
         }
         s = &s[1..];
+    }
+
+    // Inputs of `.` and `-.` are invalid.
+    // `-.` is reassigned above to `.` with `is_negative = true`.
+    if s == "." {
+        return Err(MissingDigitsError {
+            kind: MissingDigitsKind::OnlyDot { with_minus_sign: is_negative },
+        })
+        .map_err(InnerParseError::MissingDigits);
     }
 
     let max_decimals = {
@@ -240,9 +303,10 @@ fn parse_signed_to_satoshi(
                 match s.parse::<i64>() {
                     Ok(0) => return Ok((is_negative, SignedAmount::ZERO)),
                     _ =>
-                        return Err(InnerParseError::TooPrecise(TooPreciseError {
+                        return Err(TooPreciseError {
                             position: position + usize::from(is_negative),
-                        })),
+                        })
+                        .map_err(InnerParseError::TooPrecise),
                 }
             }
             s = &s[0..s.find('.').unwrap_or(s.len()) - last_n];
@@ -253,10 +317,26 @@ fn parse_signed_to_satoshi(
     };
 
     let mut decimals = None;
+    let mut prev_char: Option<PrevChar> = None;
     let mut value: i64 = 0; // as satoshis
     for (i, c) in s.char_indices() {
-        match c {
-            '0'..='9' => {
+        match (c, prev_char) {
+            // More than one decimal dot is invalid.
+            ('.', _) if decimals.is_some() =>
+                return Err(InvalidCharacterError {
+                    invalid_char: '.',
+                    position: i + usize::from(is_negative),
+                })
+                .map_err(InnerParseError::InvalidCharacter),
+            // Underscores immediately before the decimal separator are invalid.
+            ('.', Some(PrevChar::Underscore)) =>
+                return Err(BadPositionError {
+                    char: '_',
+                    position: (i - 1) + usize::from(is_negative),
+                })
+                .map_err(InnerParseError::BadPosition),
+            // A valid digit.
+            ('0'..='9', _) => {
                 // Do `value = 10 * value + digit`, catching overflows.
                 match 10_i64.checked_mul(value) {
                     None => return Err(InnerParseError::Overflow { is_negative }),
@@ -270,27 +350,41 @@ fn parse_signed_to_satoshi(
                     None => None,
                     Some(d) if d < max_decimals => Some(d + 1),
                     _ =>
-                        return Err(InnerParseError::TooPrecise(TooPreciseError {
-                            position: i + usize::from(is_negative),
-                        })),
+                        return Err(TooPreciseError { position: i + usize::from(is_negative) })
+                            .map_err(InnerParseError::TooPrecise),
                 };
+                prev_char = Some(PrevChar::Digit);
             }
-            '.' => match decimals {
-                None if max_decimals <= 0 => break,
-                None => decimals = Some(0),
-                // Double decimal dot.
-                _ =>
-                    return Err(InnerParseError::InvalidCharacter(InvalidCharacterError {
-                        invalid_char: '.',
-                        position: i + usize::from(is_negative),
-                    })),
-            },
-            c =>
-                return Err(InnerParseError::InvalidCharacter(InvalidCharacterError {
+            // A valid underscore must follow a digit.
+            ('_', Some(PrevChar::Digit)) => prev_char = Some(PrevChar::Underscore),
+            // Underscores not after a digit, i.e. '._', '__' and leading '_', are invalid.
+            ('_', _) =>
+                return Err(BadPositionError { char: '_', position: i + usize::from(is_negative) })
+                    .map_err(InnerParseError::BadPosition),
+            // A decimal dot with a denomination that does not allow decimals is invalid.
+            ('.', _) if decimals.is_none() && max_decimals <= 0 => break,
+            // A valid decimal dot.
+            ('.', _) if decimals.is_none() => {
+                decimals = Some(0);
+                prev_char = Some(PrevChar::Dot);
+            }
+            // Any character that does not match an above digit, dot or underscore arm is invalid.
+            (c, _) =>
+                return Err(InvalidCharacterError {
                     invalid_char: c,
                     position: i + usize::from(is_negative),
-                })),
+                })
+                .map_err(InnerParseError::InvalidCharacter),
         }
+    }
+
+    // The last character must not be an underscore.
+    if matches!(prev_char, Some(PrevChar::Underscore)) {
+        return Err(BadPositionError {
+            char: '_',
+            position: (s.len() - 1) + usize::from(is_negative),
+        })
+        .map_err(InnerParseError::BadPosition);
     }
 
     // Decimally shift left by `max_decimals - decimals`.
@@ -315,25 +409,29 @@ enum InnerParseError {
     Overflow { is_negative: bool },
     TooPrecise(TooPreciseError),
     MissingDigits(MissingDigitsError),
-    InputTooLarge(usize),
     InvalidCharacter(InvalidCharacterError),
+    BadPosition(BadPositionError),
 }
 
 impl From<Infallible> for InnerParseError {
+    #[inline]
     fn from(never: Infallible) -> Self { match never {} }
 }
 
 impl InnerParseError {
+    #[inline]
     fn convert(self, is_signed: bool) -> ParseAmountError {
         match self {
             Self::Overflow { is_negative } =>
-                OutOfRangeError { is_signed, is_greater_than_max: !is_negative }.into(),
+                ParseAmountError(ParseAmountErrorInner::OutOfRange(OutOfRangeError {
+                    is_signed,
+                    is_greater_than_max: !is_negative,
+                })),
             Self::TooPrecise(e) => ParseAmountError(ParseAmountErrorInner::TooPrecise(e)),
             Self::MissingDigits(e) => ParseAmountError(ParseAmountErrorInner::MissingDigits(e)),
-            Self::InputTooLarge(len) =>
-                ParseAmountError(ParseAmountErrorInner::InputTooLarge(InputTooLargeError { len })),
             Self::InvalidCharacter(e) =>
                 ParseAmountError(ParseAmountErrorInner::InvalidCharacter(e)),
+            Self::BadPosition(e) => ParseAmountError(ParseAmountErrorInner::BadPosition(e)),
         }
     }
 }
@@ -344,13 +442,15 @@ fn split_amount_and_denomination(s: &str) -> Result<(&str, Denomination), ParseE
     } else {
         let i = s
             .find(|c: char| c.is_alphabetic())
-            .ok_or(ParseError(ParseErrorInner::MissingDenomination(MissingDenominationError)))?;
+            .ok_or(MissingDenominationError)
+            .map_err(ParseErrorInner::MissingDenomination)
+            .map_err(ParseError)?;
         (i, i)
     };
-    Ok((&s[..i], s[j..].parse()?))
+    Ok((&s[..i], s[j..].parse().map_err(ParseErrorInner::Denomination).map_err(ParseError)?))
 }
 
-/// Options given by `fmt::Formatter`
+/// Options given by [`fmt::Formatter`]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct FormatOptions {
     fill: char,
@@ -362,8 +462,9 @@ struct FormatOptions {
 }
 
 impl FormatOptions {
+    #[inline]
     fn from_formatter(f: &fmt::Formatter) -> Self {
-        FormatOptions {
+        Self {
             fill: f.fill(),
             align: f.align(),
             width: f.width(),
@@ -375,8 +476,9 @@ impl FormatOptions {
 }
 
 impl Default for FormatOptions {
+    #[inline]
     fn default() -> Self {
-        FormatOptions {
+        Self {
             fill: ' ',
             align: None,
             width: None,
@@ -399,18 +501,18 @@ fn dec_width(mut num: u64) -> usize {
     width
 }
 
-fn repeat_char(f: &mut dyn fmt::Write, c: char, count: usize) -> fmt::Result {
+fn repeat_char(f: &mut fmt::Formatter, c: char, count: usize) -> fmt::Result {
     for _ in 0..count {
         f.write_char(c)?;
     }
     Ok(())
 }
 
-/// Format the given satoshi amount in the given denomination.
+/// Formats the given satoshi amount in the given denomination.
 fn fmt_satoshi_in(
     mut satoshi: u64,
     negative: bool,
-    f: &mut dyn fmt::Write,
+    f: &mut fmt::Formatter,
     denom: Denomination,
     show_denom: bool,
     options: FormatOptions,
@@ -421,15 +523,14 @@ fn fmt_satoshi_in(
     let mut num_after_decimal_point = 0;
     let mut norm_nb_decimals = 0;
     let mut num_before_decimal_point = satoshi;
-    let trailing_decimal_zeros;
     let mut exp = 0;
-    match precision.cmp(&0) {
+    let trailing_decimal_zeros = match precision.cmp(&0) {
         // We add the number of zeroes to the end
         Ordering::Greater => {
             if satoshi > 0 {
                 exp = precision as usize; // Cast ok, checked not negative above.
             }
-            trailing_decimal_zeros = options.precision.unwrap_or(0);
+            options.precision.unwrap_or(0)
         }
         Ordering::Less => {
             let precision = precision.unsigned_abs();
@@ -462,10 +563,10 @@ fn fmt_satoshi_in(
             }
             // compute requested precision
             let opt_precision = options.precision.unwrap_or(0);
-            trailing_decimal_zeros = opt_precision.saturating_sub(norm_nb_decimals);
+            opt_precision.saturating_sub(norm_nb_decimals)
         }
-        Ordering::Equal => trailing_decimal_zeros = options.precision.unwrap_or(0),
-    }
+        Ordering::Equal => options.precision.unwrap_or(0),
+    };
     let total_decimals = norm_nb_decimals + trailing_decimal_zeros;
     // Compute expected width of the number
     let mut num_width = if total_decimals > 0 {
@@ -493,7 +594,7 @@ fn fmt_satoshi_in(
         (true, false, fmt::Alignment::Left) => (0, width - num_width),
         // If the required padding is odd it needs to be skewed to the left
         (true, false, fmt::Alignment::Center) =>
-            ((width - num_width) / 2, (width - num_width + 1) / 2),
+            ((width - num_width) / 2, (width - num_width).div_ceil(2)),
     };
 
     if !options.sign_aware_zero_pad {
@@ -539,12 +640,11 @@ fn fmt_satoshi_in(
 /// * Dynamically-selected denomination - show in sats if less than 1 BTC.
 ///
 /// However, this can still be combined with [`fmt::Formatter`] options to precisely control zeros,
-/// padding, alignment... The formatting works like floats from `core` but note that precision will
-/// **never** be lossy - that means no rounding.
+/// padding, alignment... The formatting works like floats from `core`.
 ///
 /// Note: This implementation is currently **unstable**. The only thing that we can promise is that
 /// unless the precision is changed, this will display an accurate, human-readable number, and the
-/// default serialization (one with unmodified [`fmt::Formatter`] options) will round-trip with [`FromStr`]
+/// default serialization (one with unmodified [`fmt::Formatter`] options) will round-trip with [`FromStr`].
 ///
 /// See [`Amount::display_in`] and [`Amount::display_dynamic`] on how to construct this.
 #[derive(Debug, Clone)]
@@ -558,7 +658,10 @@ pub struct Display {
 }
 
 impl Display {
-    /// Makes subsequent calls to `Display::fmt` display denomination.
+    /// Makes subsequent calls to [`Display::fmt`] display denomination.
+    ///
+    /// [`Display::fmt`]: fmt::Display::fmt
+    #[inline]
     #[must_use]
     pub fn show_denomination(mut self) -> Self {
         match &mut self.style {
@@ -571,6 +674,7 @@ impl Display {
 }
 
 impl fmt::Display for Display {
+    #[inline]
     #[rustfmt::skip]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let format_options = FormatOptions::from_formatter(f);
@@ -594,33 +698,18 @@ enum DisplayStyle {
     DynamicDenomination,
 }
 
-impl<T> CheckedSum<Amount> for T
-where
-    T: Iterator<Item = Amount>,
-{
-    fn checked_sum(mut self) -> Option<Amount> { self.try_fold(Amount::ZERO, Amount::checked_add) }
-}
-
-impl<T> CheckedSum<SignedAmount> for T
-where
-    T: Iterator<Item = SignedAmount>,
-{
-    fn checked_sum(mut self) -> Option<SignedAmount> {
-        self.try_fold(SignedAmount::ZERO, SignedAmount::checked_add)
-    }
-}
-
 #[cfg(feature = "arbitrary")]
 impl<'a> Arbitrary<'a> for Denomination {
+    #[inline]
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
         let choice = u.int_in_range(0..=5)?;
         match choice {
-            0 => Ok(Denomination::Bitcoin),
-            1 => Ok(Denomination::CentiBitcoin),
-            2 => Ok(Denomination::MilliBitcoin),
-            3 => Ok(Denomination::MicroBitcoin),
-            4 => Ok(Denomination::Bit),
-            _ => Ok(Denomination::Satoshi),
+            0 => Ok(Self::Bitcoin),
+            1 => Ok(Self::CentiBitcoin),
+            2 => Ok(Self::MilliBitcoin),
+            3 => Ok(Self::MicroBitcoin),
+            4 => Ok(Self::Bit),
+            _ => Ok(Self::Satoshi),
         }
     }
 }

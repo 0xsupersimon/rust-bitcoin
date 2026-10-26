@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Provides a monodic type returned by mathematical operations (`core::ops`).
+//! Provides a monadic type returned by mathematical operations ([`core::ops`]).
 
 use core::convert::Infallible;
-use core::fmt;
+use core::{fmt, ops};
 
 #[cfg(feature = "arbitrary")]
 use arbitrary::{Arbitrary, Unstructured};
@@ -11,18 +11,22 @@ use NumOpResult as R;
 
 use crate::{Amount, FeeRate, SignedAmount, Weight};
 
+#[rustfmt::skip]                // Keep public re-exports separate.
+#[doc(no_inline)]
+pub use self::error::NumOpError;
+
 /// Result of a mathematical operation on two numeric types.
 ///
 /// In order to prevent overflow we provide a custom result type that is similar to the normal
 /// [`core::result::Result`] but implements mathematical operations (e.g. [`core::ops::Add`]) so that
 /// math operations can be chained ergonomically. This is very similar to how `NaN` works.
 ///
-/// `NumOpResult` is a monadic type that contains `Valid` and `Error` (similar to `Ok` and `Err`).
-/// It supports a subset of functions similar to `Result` (e.g. `unwrap`).
+/// [`NumOpResult`] is a monadic type that contains [`Valid`] and [`Error`] (similar to [`Ok`] and
+/// [`Err`]). It supports a subset of functions similar to [`Result`] (e.g. [`unwrap`]).
 ///
 /// # Examples
 ///
-/// The `NumOpResult` type provides protection against overflow and div-by-zero.
+/// The [`NumOpResult`] type provides protection against overflow and div-by-zero.
 ///
 /// ### Overflow protection
 ///
@@ -33,7 +37,7 @@ use crate::{Amount, FeeRate, SignedAmount, Weight};
 /// // And another value from some other UTXO.
 /// let a2 = Amount::from_sat(765_432)?;
 /// // Just an example (typically one would calculate fee using weight and fee rate).
-/// let fee = Amount::from_sat(1_00)?;
+/// let fee = Amount::from_sat(100)?;
 /// // The amount we want to send.
 /// let spend = Amount::from_sat(1_200_000)?;
 ///
@@ -50,28 +54,28 @@ use crate::{Amount, FeeRate, SignedAmount, Weight};
 /// # Ok::<_, amount::OutOfRangeError>(())
 /// ```
 ///
-/// ### Divide-by-zero (overflow in `Div` or `Rem`)
+/// ### Failure in chained operations
 ///
-/// In some instances one may wish to differentiate div-by-zero from overflow.
+/// In some instances one may wish to differentiate one math op failure from another.
 ///
 /// ```
-/// # use bitcoin_units::{Amount, FeeRate, NumOpResult, NumOpError};
+/// # use bitcoin_units::{Amount, FeeRate, NumOpResult, result::NumOpError};
 /// // Two amounts that will be added to calculate the max fee.
 /// let a = Amount::from_sat(123).expect("valid amount");
 /// let b = Amount::from_sat(467).expect("valid amount");
 /// // Fee rate for transaction.
-/// let fee_rate = FeeRate::from_sat_per_vb(1);
+/// let fee_rate = FeeRate::from_sat_per_vb_u32(1);
 ///
 /// // Somewhat contrived example to show addition operator chained with division.
 /// let max_fee = a + b;
 /// let _fee = match max_fee / fee_rate {
 ///     NumOpResult::Valid(fee) => fee,
-///     NumOpResult::Error(e) if e.is_div_by_zero() => {
-///         // Do something when div by zero.
+///     NumOpResult::Error(e) if e.operation().is_division() => {
+///         // Do something when division fails (div by zero or perhaps MIN / -1).
 ///         return Err(e);
 ///     },
 ///     NumOpResult::Error(e) => {
-///         // We separate div-by-zero from overflow in case it needs to be handled separately.
+///         // And something else if the addition overflowed.
 ///         //
 ///         // This branch could be hit since `max_fee` came from some previous calculation. And if
 ///         // an input to that calculation was from the user then overflow could be an attack vector.
@@ -80,6 +84,12 @@ use crate::{Amount, FeeRate, SignedAmount, Weight};
 /// };
 /// # Ok::<_, NumOpError>(())
 /// ```
+///
+/// If both operands of a binary op are already [`Error`], only the left-hand error is returned.
+///
+/// [`Valid`]: NumOpResult::Valid
+/// [`Error`]: NumOpResult::Error
+/// [`unwrap`]: NumOpResult::unwrap
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[must_use]
 pub enum NumOpResult<T> {
@@ -90,29 +100,29 @@ pub enum NumOpResult<T> {
 }
 
 impl<T> NumOpResult<T> {
-    /// Maps a `NumOpResult<T>` to `NumOpResult<U>` by applying a function to a
+    /// Maps a [`NumOpResult<T>`] to [`NumOpResult<U>`] by applying a function to a
     /// contained [`NumOpResult::Valid`] value, leaving a [`NumOpResult::Error`] value untouched.
     #[inline]
     pub fn map<U, F: FnOnce(T) -> U>(self, op: F) -> NumOpResult<U> {
         match self {
-            NumOpResult::Valid(t) => NumOpResult::Valid(op(t)),
-            NumOpResult::Error(e) => NumOpResult::Error(e),
+            Self::Valid(t) => NumOpResult::Valid(op(t)),
+            Self::Error(e) => NumOpResult::Error(e),
         }
     }
-}
 
-impl<T: fmt::Debug> NumOpResult<T> {
     /// Returns the contained valid numeric type, consuming `self`.
     ///
     /// # Panics
     ///
-    /// Panics with `msg` if the numeric result is an `Error`.
+    /// Panics with `msg` if the numeric result is an [`Error`].
+    ///
+    /// [`Error`]: NumOpResult::Error
     #[inline]
     #[track_caller]
     pub fn expect(self, msg: &str) -> T {
         match self {
-            R::Valid(x) => x,
-            R::Error(_) => panic!("{}", msg),
+            Self::Valid(x) => x,
+            Self::Error(_) => panic!("{}", msg),
         }
     }
 
@@ -120,16 +130,107 @@ impl<T: fmt::Debug> NumOpResult<T> {
     ///
     /// # Panics
     ///
-    /// Panics if the numeric result is an `Error`.
+    /// Panics if the numeric result is an [`Error`].
+    ///
+    /// [`Error`]: NumOpResult::Error
     #[inline]
     #[track_caller]
     pub fn unwrap(self) -> T {
         match self {
-            R::Valid(x) => x,
-            R::Error(e) => panic!("tried to unwrap an invalid numeric result: {:?}", e),
+            Self::Valid(x) => x,
+            Self::Error(e) => panic!("tried to unwrap an invalid numeric result: {:?}", e),
         }
     }
 
+    /// Returns the contained [`Valid`] value or a provided default.
+    ///
+    /// Arguments passed to [`unwrap_or`] are eagerly evaluated; if you are passing the result of a
+    /// function call, it is recommended to use [`unwrap_or_else`], which is lazily evaluated.
+    ///
+    /// [`Valid`]: NumOpResult::Valid
+    /// [`unwrap_or`]: NumOpResult::unwrap_or
+    /// [`unwrap_or_else`]: NumOpResult::unwrap_or_else
+    #[inline]
+    pub fn unwrap_or(self, default: T) -> T {
+        match self {
+            Self::Valid(x) => x,
+            Self::Error(_) => default,
+        }
+    }
+
+    /// Returns the contained [`Valid`] value or computes it from a closure.
+    ///
+    /// [`Valid`]: NumOpResult::Valid
+    #[inline]
+    pub fn unwrap_or_else<F>(self, f: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        match self {
+            Self::Valid(x) => x,
+            Self::Error(_) => f(),
+        }
+    }
+
+    /// Converts this [`NumOpResult`] to an [`Option<T>`].
+    #[inline]
+    pub fn ok(self) -> Option<T> {
+        match self {
+            Self::Valid(x) => Some(x),
+            Self::Error(_) => None,
+        }
+    }
+
+    /// Converts this [`NumOpResult`] to a [`Result<T, NumOpError>`].
+    #[inline]
+    #[allow(clippy::missing_errors_doc)]
+    pub fn into_result(self) -> Result<T, NumOpError> {
+        match self {
+            Self::Valid(x) => Ok(x),
+            Self::Error(e) => Err(e),
+        }
+    }
+
+    /// Converts a [`Result<T, NumOpError>`] to a [`NumOpResult`].
+    #[inline]
+    pub fn from_result(result: Result<T, NumOpError>) -> Self {
+        match result {
+            Ok(x) => Self::Valid(x),
+            Err(e) => Self::Error(e),
+        }
+    }
+
+    /// Calls `op` if the numeric result is [`Valid`], otherwise returns the [`Error`] value of
+    /// `self`.
+    ///
+    /// [`Valid`]: NumOpResult::Valid
+    /// [`Error`]: NumOpResult::Error
+    #[inline]
+    pub fn and_then<F>(self, op: F) -> Self
+    where
+        F: FnOnce(T) -> Self,
+    {
+        match self {
+            Self::Valid(x) => op(x),
+            Self::Error(e) => Self::Error(e),
+        }
+    }
+
+    /// Returns `true` if the numeric result is valid.
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::Valid(_) => true,
+            Self::Error(_) => false,
+        }
+    }
+
+    /// Returns `true` if the numeric result is invalid.
+    #[inline]
+    pub fn is_error(&self) -> bool { !self.is_valid() }
+}
+
+impl<T: fmt::Debug> NumOpResult<T> {
     /// Returns the contained error, consuming `self`.
     ///
     /// # Panics
@@ -139,84 +240,116 @@ impl<T: fmt::Debug> NumOpResult<T> {
     #[track_caller]
     pub fn unwrap_err(self) -> NumOpError {
         match self {
-            R::Error(e) => e,
-            R::Valid(a) => panic!("tried to unwrap a valid numeric result: {:?}", a),
+            Self::Error(e) => e,
+            Self::Valid(a) => panic!("tried to unwrap a valid numeric result: {:?}", a),
+        }
+    }
+}
+
+// Implement Add/Sub on NumOpResults for all wrapped types that already implement Add/Sub on themselves
+crate::internal_macros::impl_op_for_references! {
+    impl<T> ops::Add<NumOpResult<T>> for NumOpResult<T>
+    where
+        (T: Copy + ops::Add<Output = NumOpResult<T>>)
+    {
+        type Output = NumOpResult<T>;
+
+        fn add(self, rhs: Self) -> Self::Output {
+            match (self, rhs) {
+                (R::Valid(lhs), R::Valid(rhs)) => lhs + rhs,
+                (R::Error(e), _) => R::Error(e),
+                (_, R::Error(e)) => R::Error(e),
+            }
         }
     }
 
-    /// Returns the contained Some value or a provided default.
-    ///
-    /// Arguments passed to `unwrap_or` are eagerly evaluated; if you are passing the result of a
-    /// function call, it is recommended to use `unwrap_or_else`, which is lazily evaluated.
+    impl<T> ops::Add<T> for NumOpResult<T>
+    where
+        (T: Copy + ops::Add<NumOpResult<T>, Output = NumOpResult<T>>)
+    {
+        type Output = NumOpResult<T>;
+
+        fn add(self, rhs: T) -> Self::Output { rhs + self }
+    }
+
+    impl<T> ops::Sub<NumOpResult<T>> for NumOpResult<T>
+    where
+        (T: Copy + ops::Sub<Output = NumOpResult<T>>)
+    {
+        type Output = NumOpResult<T>;
+
+        fn sub(self, rhs: Self) -> Self::Output {
+            match (self, rhs) {
+                (R::Valid(lhs), R::Valid(rhs)) => lhs - rhs,
+                (R::Error(e), _) => R::Error(e),
+                (_, R::Error(e)) => R::Error(e),
+            }
+        }
+    }
+
+    impl<T> ops::Sub<T> for NumOpResult<T>
+    where
+        (T: Copy + ops::Sub<Output = NumOpResult<T>>)
+    {
+        type Output = NumOpResult<T>;
+
+        fn sub(self, rhs: T) -> Self::Output {
+            match self {
+                R::Valid(amount) => amount - rhs,
+                R::Error(_) => self,
+            }
+        }
+    }
+}
+
+// Implement AddAssign on NumOpResults for all wrapped types that already implement AddAssign on themselves
+impl<T: ops::AddAssign> ops::AddAssign<T> for NumOpResult<T> {
     #[inline]
     #[track_caller]
-    pub fn unwrap_or(self, default: T) -> T {
-        match self {
-            R::Valid(x) => x,
-            R::Error(_) => default,
+    fn add_assign(&mut self, rhs: T) {
+        if let Self::Valid(ref mut lhs) = self {
+            *lhs += rhs;
         }
     }
+}
 
-    /// Returns the contained `Some` value or computes it from a closure.
+impl<T: ops::AddAssign + Copy> ops::AddAssign<Self> for NumOpResult<T> {
     #[inline]
     #[track_caller]
-    pub fn unwrap_or_else<F>(self, f: F) -> T
-    where
-        F: FnOnce() -> T,
-    {
-        match self {
-            R::Valid(x) => x,
-            R::Error(_) => f(),
+    fn add_assign(&mut self, rhs: Self) {
+        match (&self, rhs) {
+            (Self::Valid(_), Self::Valid(rhs)) => *self += rhs,
+            (Self::Valid(_), Self::Error(err)) => *self = Self::Error(err),
+            (Self::Error(_), _) => (), // If the lhs is an error, preserve it
         }
     }
+}
 
-    /// Converts this `NumOpResult` to an `Option<T>`.
+// Implement SubAssign on NumOpResults for all wrapped types that already implement SubAssign on themselves
+impl<T: ops::SubAssign> ops::SubAssign<T> for NumOpResult<T> {
     #[inline]
-    pub fn ok(self) -> Option<T> {
-        match self {
-            R::Valid(x) => Some(x),
-            R::Error(_) => None,
+    #[track_caller]
+    fn sub_assign(&mut self, rhs: T) {
+        if let Self::Valid(ref mut lhs) = self {
+            *lhs -= rhs;
         }
     }
+}
 
-    /// Converts this `NumOpResult` to a `Result<T, NumOpError>`.
+impl<T: ops::SubAssign + Copy> ops::SubAssign<Self> for NumOpResult<T> {
     #[inline]
-    #[allow(clippy::missing_errors_doc)]
-    pub fn into_result(self) -> Result<T, NumOpError> {
-        match self {
-            R::Valid(x) => Ok(x),
-            R::Error(e) => Err(e),
+    #[track_caller]
+    fn sub_assign(&mut self, rhs: Self) {
+        match (&self, rhs) {
+            (Self::Valid(_), Self::Valid(rhs)) => *self -= rhs,
+            (Self::Valid(_), Self::Error(err)) => *self = Self::Error(err),
+            (Self::Error(_), _) => (), // If the lhs is an error, preserve it
         }
     }
-
-    /// Calls `op` if the numeric result is `Valid`, otherwise returns the `Error` value of `self`.
-    #[inline]
-    pub fn and_then<F>(self, op: F) -> NumOpResult<T>
-    where
-        F: FnOnce(T) -> NumOpResult<T>,
-    {
-        match self {
-            R::Valid(x) => op(x),
-            R::Error(e) => R::Error(e),
-        }
-    }
-
-    /// Returns `true` if the numeric result is valid.
-    #[inline]
-    pub fn is_valid(&self) -> bool {
-        match self {
-            R::Valid(_) => true,
-            R::Error(_) => false,
-        }
-    }
-
-    /// Returns `true` if the numeric result is invalid.
-    #[inline]
-    pub fn is_error(&self) -> bool { !self.is_valid() }
 }
 
 pub(crate) trait OptionExt<T> {
-    fn valid_or_error(self, op: MathOp) -> NumOpResult<T>;
+    fn valid_or_error(self, kind: MathErrorKind) -> NumOpResult<T>;
 }
 
 macro_rules! impl_opt_ext {
@@ -224,10 +357,10 @@ macro_rules! impl_opt_ext {
         $(
             impl OptionExt<$ty> for Option<$ty> {
                 #[inline]
-                fn valid_or_error(self, op: MathOp) -> NumOpResult<$ty> {
+                fn valid_or_error(self, kind: MathErrorKind) -> NumOpResult<$ty> {
                     match self {
                         Some(amount) => R::Valid(amount),
-                        None => R::Error(NumOpError(op)),
+                        None => R::Error(NumOpError::while_doing(kind)),
                     }
                 }
             }
@@ -235,34 +368,6 @@ macro_rules! impl_opt_ext {
     }
 }
 impl_opt_ext!(Amount, SignedAmount, u64, i64, FeeRate, Weight);
-
-/// Error returned when a mathematical operation fails.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct NumOpError(MathOp);
-
-impl NumOpError {
-    /// Creates a [`NumOpError`] caused by `op`.
-    pub(crate) const fn while_doing(op: MathOp) -> Self { NumOpError(op) }
-
-    /// Returns `true` if this operation error'ed due to overflow.
-    pub fn is_overflow(self) -> bool { self.0.is_overflow() }
-
-    /// Returns `true` if this operation error'ed due to division by zero.
-    pub fn is_div_by_zero(self) -> bool { self.0.is_div_by_zero() }
-
-    /// Returns the [`MathOp`] that caused this error.
-    pub fn operation(self) -> MathOp { self.0 }
-}
-
-impl fmt::Display for NumOpError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "math operation '{}' gave an invalid numeric result", self.operation())
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for NumOpError {}
 
 /// The math operation that caused the error.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -287,84 +392,170 @@ pub enum MathOp {
 }
 
 impl MathOp {
-    /// Returns `true` if this operation error'ed due to overflow.
-    pub fn is_overflow(self) -> bool {
-        matches!(self, MathOp::Add | MathOp::Sub | MathOp::Mul | MathOp::Neg)
-    }
-
-    /// Returns `true` if this operation error'ed due to division by zero.
-    pub fn is_div_by_zero(self) -> bool { !self.is_overflow() }
-
     /// Returns `true` if this operation error'ed due to addition.
-    pub fn is_addition(self) -> bool { self == MathOp::Add }
+    #[inline]
+    pub fn is_addition(self) -> bool { self == Self::Add }
 
     /// Returns `true` if this operation error'ed due to subtraction.
-    pub fn is_subtraction(self) -> bool { self == MathOp::Sub }
+    #[inline]
+    pub fn is_subtraction(self) -> bool { self == Self::Sub }
 
     /// Returns `true` if this operation error'ed due to multiplication.
-    pub fn is_multiplication(self) -> bool { self == MathOp::Mul }
+    #[inline]
+    pub fn is_multiplication(self) -> bool { self == Self::Mul }
+
+    /// Returns `true` if this operation error'ed due to division.
+    #[inline]
+    pub fn is_division(self) -> bool { self == Self::Div }
+
+    /// Returns `true` if this operation error'ed due to remainder.
+    #[inline]
+    pub fn is_remainder(self) -> bool { self == Self::Rem }
 
     /// Returns `true` if this operation error'ed due to negation.
-    pub fn is_negation(self) -> bool { self == MathOp::Neg }
+    #[inline]
+    pub fn is_negation(self) -> bool { self == Self::Neg }
 }
 
 impl fmt::Display for MathOp {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            MathOp::Add => write!(f, "add"),
-            MathOp::Sub => write!(f, "sub"),
-            MathOp::Mul => write!(f, "mul"),
-            MathOp::Div => write!(f, "div"),
-            MathOp::Rem => write!(f, "rem"),
-            MathOp::Neg => write!(f, "neg"),
-            MathOp::_DoNotUse(infallible) => match infallible {},
+            Self::Add => write!(f, "add"),
+            Self::Sub => write!(f, "sub"),
+            Self::Mul => write!(f, "mul"),
+            Self::Div => write!(f, "div"),
+            Self::Rem => write!(f, "rem"),
+            Self::Neg => write!(f, "neg"),
+            Self::_DoNotUse(infallible) => match infallible {},
+        }
+    }
+}
+
+/// The kind of error that happened during a mathematical operation failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MathErrorKind {
+    // The result overflowed.
+    Overflow {
+        op: MathOp,
+        is_negative: bool,
+    },
+    /// A division by zero was performed.
+    DivByZero,
+    /// A remainder by zero was performed.
+    RemByZero,
+}
+
+/// Error types for mathematical operations.
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
+
+    use super::{MathErrorKind, MathOp};
+
+    /// Error returned when a mathematical operation fails.
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct NumOpError(pub(crate) MathErrorKind);
+
+    impl NumOpError {
+        /// Constructs a [`NumOpError`] caused by `kind`.
+        #[inline]
+        pub(crate) const fn while_doing(kind: MathErrorKind) -> Self { Self(kind) }
+
+        /// Returns the [`MathOp`] that caused this error.
+        #[inline]
+        pub fn operation(self) -> MathOp {
+            match self.0 {
+                MathErrorKind::DivByZero => MathOp::Div,
+                MathErrorKind::RemByZero => MathOp::Rem,
+                MathErrorKind::Overflow { op, is_negative: _ } => op,
+            }
+        }
+    }
+
+    impl From<Infallible> for NumOpError {
+        #[inline]
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for NumOpError {
+        #[inline]
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self.0 {
+                MathErrorKind::Overflow { op, is_negative: false } =>
+                    write!(f, "failed to {}: the result would be too large", op),
+                MathErrorKind::Overflow { op, is_negative: true } =>
+                    write!(f, "failed to {}: the result would be too small", op),
+                MathErrorKind::DivByZero => write!(f, "division by zero"),
+                MathErrorKind::RemByZero =>
+                    write!(f, "attempt to compute the remainder of division by zero"),
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for NumOpError {
+        #[inline]
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            let Self(_) = self;
+            None
         }
     }
 }
 
 #[cfg(feature = "arbitrary")]
 impl<'a, T: Arbitrary<'a>> Arbitrary<'a> for NumOpResult<T> {
+    #[inline]
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-        let choice = u.int_in_range(0..=1)?;
-        match choice {
-            0 => Ok(NumOpResult::Valid(T::arbitrary(u)?)),
-            _ => Ok(NumOpResult::Error(NumOpError(MathOp::arbitrary(u)?))),
+        match bool::arbitrary(u)? {
+            true => Ok(Self::Valid(T::arbitrary(u)?)),
+            false => Ok(Self::Error(NumOpError(MathErrorKind::arbitrary(u)?))),
         }
     }
 }
 
 #[cfg(feature = "arbitrary")]
 impl<'a> Arbitrary<'a> for MathOp {
+    #[inline]
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
         let choice = u.int_in_range(0..=5)?;
         match choice {
-            0 => Ok(MathOp::Add),
-            1 => Ok(MathOp::Sub),
-            2 => Ok(MathOp::Mul),
-            3 => Ok(MathOp::Div),
-            4 => Ok(MathOp::Rem),
-            _ => Ok(MathOp::Neg),
+            0 => Ok(Self::Add),
+            1 => Ok(Self::Sub),
+            2 => Ok(Self::Mul),
+            3 => Ok(Self::Div),
+            4 => Ok(Self::Rem),
+            _ => Ok(Self::Neg),
+        }
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+impl<'a> Arbitrary<'a> for MathErrorKind {
+    #[inline]
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        let choice = u.int_in_range(0..=2)?;
+        match choice {
+            0 => Ok(Self::Overflow { op: MathOp::arbitrary(u)?, is_negative: bool::arbitrary(u)? }),
+            1 => Ok(Self::RemByZero),
+            _ => Ok(Self::DivByZero),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::MathOp;
+    #[cfg(feature = "alloc")]
+    use alloc::string::ToString;
+    #[cfg(feature = "std")]
+    use std::error::Error;
+
+    use crate::result::{MathErrorKind, MathOp, NumOpError, NumOpResult};
+    use crate::{Amount, FeeRate, Weight};
 
     #[test]
     fn mathop_predicates() {
-        assert!(MathOp::Add.is_overflow());
-        assert!(MathOp::Sub.is_overflow());
-        assert!(MathOp::Mul.is_overflow());
-        assert!(MathOp::Neg.is_overflow());
-        assert!(!MathOp::Div.is_overflow());
-        assert!(!MathOp::Rem.is_overflow());
-
-        assert!(MathOp::Div.is_div_by_zero());
-        assert!(MathOp::Rem.is_div_by_zero());
-        assert!(!MathOp::Add.is_div_by_zero());
-
         assert!(MathOp::Add.is_addition());
         assert!(!MathOp::Sub.is_addition());
 
@@ -376,5 +567,210 @@ mod tests {
 
         assert!(MathOp::Neg.is_negation());
         assert!(!MathOp::Add.is_negation());
+
+        assert!(MathOp::Div.is_division());
+        assert!(!MathOp::Rem.is_division());
+
+        assert!(MathOp::Rem.is_remainder());
+        assert!(!MathOp::Div.is_remainder());
+    }
+
+    #[test]
+    fn mathop_map() {
+        // op is evaluated for valid results
+        let res = NumOpResult::Valid(Amount::from_sat_u32(100));
+        let new_value = res.map(|val| (val / FeeRate::from_sat_per_kwu_u32(10)).unwrap());
+        assert_eq!(new_value, NumOpResult::Valid(Weight::from_wu(10_000)));
+
+        // op is not evaluated for error results
+        let res = NumOpResult::<Weight>::Error(NumOpError::while_doing(MathErrorKind::Overflow {
+            op: MathOp::Add,
+            is_negative: false,
+        }));
+        let res_err = res.map(|_| {
+            panic!("map should not evaluate for wrapped error values");
+        });
+        assert_eq!(res_err, res);
+    }
+
+    #[test]
+    fn mathop_expect() {
+        let amounts = [
+            Amount::from_sat_u32(0),
+            Amount::from_sat_u32(10_000_000),
+            Amount::from_sat_u32(u32::MAX),
+        ];
+        for amount in amounts {
+            assert_eq!(
+                NumOpResult::Valid(amount).expect("unreachable"),
+                NumOpResult::Valid(amount).unwrap(),
+            );
+            assert_eq!(NumOpResult::Valid(amount).expect("unreachable"), amount);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "test error message")]
+    fn mathop_expect_panics_on_error() {
+        NumOpResult::<Amount>::Error(NumOpError::while_doing(MathErrorKind::Overflow {
+            op: MathOp::Add,
+            is_negative: false,
+        }))
+        .expect("test error message");
+    }
+
+    #[test]
+    fn mathop_unwrap() {
+        let amounts = [
+            Amount::from_sat_u32(0),
+            Amount::from_sat_u32(10_000_000),
+            Amount::from_sat_u32(u32::MAX),
+        ];
+        for amount in amounts {
+            assert_eq!(NumOpResult::Valid(amount).unwrap(), amount);
+        }
+        let weights = [Weight::from_wu(0), Weight::from_wu(16_384_000), Weight::from_wu(u64::MAX)];
+        for weight in weights {
+            assert_eq!(NumOpResult::Valid(weight).unwrap(), weight);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "")]
+    fn mathop_unwrap_panics_on_err() {
+        NumOpResult::<Amount>::Error(NumOpError::while_doing(MathErrorKind::Overflow {
+            op: MathOp::Add,
+            is_negative: false,
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn mathop_unwrap_err() {
+        let errs = [
+            NumOpError::while_doing(MathErrorKind::Overflow {
+                op: MathOp::Add,
+                is_negative: false,
+            }),
+            NumOpError::while_doing(MathErrorKind::Overflow { op: MathOp::Sub, is_negative: true }),
+            NumOpError::while_doing(MathErrorKind::Overflow {
+                op: MathOp::Mul,
+                is_negative: false,
+            }),
+            NumOpError::while_doing(MathErrorKind::DivByZero),
+            NumOpError::while_doing(MathErrorKind::Overflow {
+                op: MathOp::Neg,
+                is_negative: false,
+            }),
+            NumOpError::while_doing(MathErrorKind::RemByZero),
+        ];
+        for err in errs {
+            assert_eq!(NumOpResult::<Amount>::Error(err).unwrap_err(), err);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "")]
+    fn mathop_unwrap_err_panics_on_valid() {
+        let value = Amount::from_sat_u32(150);
+        NumOpResult::<Amount>::Valid(value).unwrap_err();
+    }
+
+    #[test]
+    fn mathop_unwrap_or() {
+        let base_amount = Amount::from_sat_u32(100);
+
+        // default is returned for error results
+        let res = NumOpResult::<Amount>::Error(NumOpError::while_doing(MathErrorKind::Overflow {
+            op: MathOp::Add,
+            is_negative: false,
+        }));
+        let res_default = res.unwrap_or(base_amount);
+        assert_eq!(res_default, base_amount);
+
+        // wrapped value is returned for valid results
+        let res = NumOpResult::Valid(base_amount);
+        let new_amount = res.unwrap_or(Amount::from_sat_u32(50));
+        assert_eq!(new_amount, base_amount);
+    }
+
+    #[test]
+    fn mathop_unwrap_or_else() {
+        let base_amount = Amount::from_sat_u32(100);
+
+        // op is evaluated for error results
+        let res = NumOpResult::<Amount>::Error(NumOpError::while_doing(MathErrorKind::Overflow {
+            op: MathOp::Add,
+            is_negative: false,
+        }));
+        let res_default = res.unwrap_or_else(|| base_amount);
+        assert_eq!(res_default, base_amount);
+
+        // op is not evaluated for valid results
+        let res = NumOpResult::<Amount>::Valid(base_amount);
+        let new_amount = res.unwrap_or_else(|| {
+            panic!("unwrap_or_else should not evaluate for wrapped valid values");
+        });
+        assert_eq!(new_amount, base_amount);
+    }
+
+    #[test]
+    fn mathop_ok() {
+        let amt = Amount::from_sat_u32(150);
+        assert_eq!(NumOpResult::Valid(amt).ok(), Some(amt));
+
+        let err = NumOpError::while_doing(MathErrorKind::Overflow {
+            op: MathOp::Add,
+            is_negative: false,
+        });
+        assert_eq!(NumOpResult::<Amount>::Error(err).ok(), None);
+    }
+
+    #[test]
+    fn mathop_and_then() {
+        // op is evaluated for valid results
+        let res = NumOpResult::Valid(Amount::from_sat_u32(100));
+        let new_value = res.and_then(|val| val + Amount::from_sat_u32(50));
+        assert_eq!(new_value, NumOpResult::Valid(Amount::from_sat_u32(150)));
+
+        // op is not evaluated for error results
+        let res = NumOpResult::<Amount>::Error(NumOpError::while_doing(MathErrorKind::Overflow {
+            op: MathOp::Add,
+            is_negative: false,
+        }));
+        let res_err = res.and_then(|_| {
+            panic!("and_then should not evaluate for wrapped error values");
+        });
+        assert_eq!(res_err, res);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn error_display_is_non_empty() {
+        // NumOpError - math operation error
+        let e = (Amount::MAX + Amount::MAX).unwrap_err();
+        assert!(!e.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(e.source().is_none());
+    }
+
+    #[test]
+    fn add_preserves_division_by_zero_error() {
+        let division_by_zero = Amount::from_sat_u32(1) / 0_u64;
+        let valid = NumOpResult::Valid(Amount::ZERO);
+
+        let combined = division_by_zero + valid;
+
+        assert!(combined.unwrap_err().operation().is_division());
+    }
+
+    #[test]
+    fn sub_preserves_division_by_zero_error() {
+        let division_by_zero = Amount::from_sat_u32(1) / 0_u64;
+        let valid = NumOpResult::Valid(Amount::ZERO);
+
+        let combined = valid - division_by_zero;
+
+        assert!(combined.unwrap_err().operation().is_division());
     }
 }

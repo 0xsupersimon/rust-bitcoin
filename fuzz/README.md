@@ -1,7 +1,7 @@
 # Fuzzing
 
-`bitcoin` and `bitcoin_hashes` have fuzzing harnesses setup for use with
-honggfuzz.
+`rust-bitcoin` has fuzzing harnesses setup for use with
+`cargo-fuzz`.
 
 To run the fuzz-tests as in CI -- briefly fuzzing every target -- simply
 run
@@ -12,17 +12,12 @@ run
 
 in this directory.
 
-To build honggfuzz, you must have libunwind on your system, as well as
-libopcodes and libbfd from binutils **2.38** on your system. The most
-recently-released binutils 2.39 has changed their API in a breaking way.
-
-On Nix, you can obtain these libraries by running
+By default, `fuzz.sh` runs each target for 100 seconds. Pass
+`-max_total_time` to run for longer or shorter:
 
 ```bash
-nix-shell -p libopcodes_2_38 -p libunwind
+./fuzz.sh -max_total_time=300
 ```
-
-and then run `fuzz.sh` as above.
 
 ## Fuzzing with weak cryptography
 
@@ -32,7 +27,7 @@ things such as forging signatures or finding preimages to hashes.
 
 Doing so may result in spurious bug reports since the broken crypto does
 not respect the encoding or algebraic invariants upheld by the real crypto. We
-would like to improve this but it's a nontrivial problem -- though not
+would like to improve this, but it's a nontrivial problem -- though not
 beyond the abilities of a motivated student with a few months of time.
 Please let us know if you are interested in taking this on!
 
@@ -54,26 +49,28 @@ fuzzer can break your crypto, so can anybody.
 To see the full list of targets, the most straightforward way is to run
 
 ```bash
-source ./fuzz-util.sh
-listTargetNames
+cargo fuzz list
 ```
 
-To run each of them for an hour, run
+To run continuous fuzzing, use the `-cycle` flag:
 
 ```bash
-./cycle.sh
+./fuzz.sh -cycle
+```
+
+This will loop through each target indefinitely, running each for 1 hour
+by default. The fuzzer will run at low process priority (using `chrt`) to
+avoid blocking other work. Pass `-max_total_time` to customize the duration:
+
+```bash
+./fuzz.sh -cycle -max_total_time=7200
 ```
 
 To run a single fuzztest indefinitely, run
 
 ```bash
-HFUZZ_BUILD_ARGS='--features honggfuzz_fuzz' cargo hfuzz run <target>
+./fuzz.sh -cycle <target>
 ```
-
-This script uses the `chrt` utility to try to reduce the priority of the
-jobs. If you would like to run for longer, the most straightforward way
-is to edit `cycle.sh` before starting. To run the fuzz-tests in parallel,
-you will need to implement a custom harness.
 
 ## Adding fuzz tests
 
@@ -82,16 +79,13 @@ one is as simple as copying an existing one and editing the `do_test`
 function to do what you want.
 
 If your test clearly belongs to a specific crate, please put it in that
-crate's directory. Otherwise you can put it directly in `fuzz_target/`.
+crate's directory. Otherwise, you can put it directly in `fuzz_target/`.
 
-If you need to add dependencies, edit the file `generate-files.sh` to add
-it to the generated `Cargo.toml`.
-
-Once you've added a fuzztest, regenerate the `Cargo.toml` and CI job by
-running
+Once you've added a fuzztest, regenerate the `[[bins]]` section in the
+`Cargo.toml` manifest by running
 
 ```bash
-./generate-files.sh
+./generate-bins.sh
 ```
 
 Then to test your fuzztest, run
@@ -101,32 +95,112 @@ Then to test your fuzztest, run
 ```
 
 If it is working, you will see a rapid stream of data for many seconds
-(you can hit Ctrl+C to stop it early). If not, you should quickly see
-an error.
+(you can hit Ctrl+C to stop it early) that looks something like this:
+```text
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 2953319389
+INFO: Loaded 1 modules   (9121 inline 8-bit counters): 9121 [0x104132ea0, 0x104135241),
+INFO: Loaded 1 PC tables (9121 PCs): 9121 [0x104135248,0x104158c58),
+INFO:        0 files found in /some/path/to/rust-bitcoin/fuzz/corpus/units_arbitrary_weight
+INFO: -max_len is not provided; libFuzzer will not generate inputs larger than 4096 bytes
+INFO: A corpus is not provided, starting from an empty corpus
+#2	INITED cov: 42 ft: 42 corp: 1/1b exec/s: 0 rss: 36Mb
+#411	NEW    cov: 43 ft: 43 corp: 2/9b lim: 8 exec/s: 0 rss: 37Mb L: 8/8 MS: 4 ChangeBinInt-ShuffleBytes-ShuffleBytes-InsertRepeatedBytes-
+#1329	NEW    cov: 43 ft: 44 corp: 3/26b lim: 17 exec/s: 0 rss: 37Mb L: 17/17 MS: 3 InsertRepeatedBytes-CMP-CopyPart- DE: "\001\000\000\000"-
+#1357	REDUCE cov: 43 ft: 44 corp: 3/25b lim: 17 exec/s: 0 rss: 37Mb L: 16/16 MS: 3 CopyPart-CMP-EraseBytes- DE: "\000\000\000\000\000\000\000\000"-
+...
+```
+If you don't see this, you should quickly see an error.
+
+## Custom mutators
+
+Some targets sit behind a checksum, or behind a checksummed string encoding. Random byte
+mutation cannot satisfy those: changing any byte invalidates the envelope, so the fuzzer
+spends its whole budget being rejected and never reaches the parser inside.
+
+This is the same wall that [fuzzing with weak cryptography](#fuzzing-with-weak-cryptography)
+runs into, approached from the other side. Weak crypto lowers the wall for the whole binary,
+which is why that section warns about spurious bug reports: a hash the fuzzer can break no
+longer upholds the invariants the surrounding code was written against. A custom mutator leaves
+the wall where it is and computes the answer instead, so the target still runs against real
+hashing and whatever it finds is real.
+
+That only works where the answer is computable. A checksum over bytes we already hold is; a
+preimage or a forged signature is not, and those still need the weak-crypto build. So the two
+compose rather than compete: `fuzz.sh` passes `--cfg=hashes_fuzz` by default and the mutators
+work under it, because a mutator computes its checksum with the same hash implementation its
+target verifies with. Drop the flag and the checksummed targets keep working just as well.
+
+The mutators live in `src/mutate/`, one per envelope shape, and are attached to a target with
+`libfuzzer_sys::fuzz_mutator!`.
+
+Two things are worth knowing before writing another one.
+
+libFuzzer stops generating inputs of its own as soon as a custom mutator exists, so a mutator
+that only ever emits well-formed inputs makes every error path unreachable. The ones here
+deliberately leave a share of their output alone, or broken, for that reason.
+
+`libfuzzer_sys::fuzzer_mutate` is an `extern "C"` call into the libFuzzer runtime, which is
+only linked into a fuzz target binary. Mutators therefore take it as a parameter rather than
+calling it directly, which is what lets `src/mutate/` be an ordinary library with ordinary unit
+tests:
+
+```bash
+cargo test -p bitcoin-fuzz --lib
+```
+
+Those tests are worth extending along with any mutator, since a mutator that quietly stops
+producing valid inputs looks exactly like a target that has stopped finding bugs.
+
+libFuzzer prints `INFO: found LLVMFuzzerCustomMutator` on startup when a mutator is wired up
+correctly, and disables `-len_control` as a side effect. If that line is missing, the target is
+being fuzzed without its mutator.
 
 ## Reproducing Failures
 
 If a fuzztest fails, it will exit with a summary which looks something like
+```text
+...
+thread '<unnamed>' (3001874) panicked at units/src/weight.rs:103:25:
+attempt to multiply with overflow
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+==66478== ERROR: libFuzzer: deadly signal
+    #0 0x0001049fd3c4 in __sanitizer_print_stack_trace+0x28 (librustc-nightly_rt.asan.dylib:arm64+0x5d3c4)
+    #1 0x000104078b90 in fuzzer::PrintStackTrace()+0x30 (units_arbitrary_weight:arm64+0x100070b90)
+    #2 0x00010406d074 in fuzzer::Fuzzer::CrashCallback()+0x54 (units_arbitrary_weight:arm64+0x100065074)
+    #3 0x000180d26740 in _sigtramp+0x34 (libsystem_platform.dylib:arm64+0x3740)
+    ...
+```
+This will tell you where the test failed and is followed by information about how to reproduce the crash.
+It will look something like this:
 
 ```text
 ...
- fuzzTarget      : hfuzz_target/x86_64-unknown-linux-gnu/release/hashes_sha256 
-CRASH:
-DESCRIPTION: 
-ORIG_FNAME: 00000000000000000000000000000000.00000000.honggfuzz.cov
-FUZZ_FNAME: hfuzz_workspace/hashes_sha256/SIGABRT.PC.7ffff7c8abc7.STACK.18826d9b64.CODE.-6.ADDR.0.INSTR.mov____%eax,%ebp.fuzz
-...
-=====================================================================
-fff400610004
+NOTE: libFuzzer has rudimentary signal handlers.
+      Combine libFuzzer with AddressSanitizer or similar for better crash reports.
+SUMMARY: libFuzzer: deadly signal
+MS: 2 ChangeByte-CopyPart-; base unit: 25058c6b0d02cd1d71a030ad61c46b7396ddcdb9
+0x5e,0x5e,0x5e,0x5e,0x5e,0x44,0x0,0x0,0x0,0x0,0x0,0x5d,0x1,0x0,0x0,0x0,0x0,0x0,0x0,0x5e,0xa,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0xa5,0x1,0x1,0x1,
+^^^^^D\000\000\000\000\000]\001\000\000\000\000\000\000^\012\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\245\001\001\001
+artifact_prefix='/some/path/to/rust-bitcoin/fuzz/artifacts/units_arbitrary_weight/'; Test unit written to /some/path/to/rust-bitcoin/fuzz/artifacts/units_arbitrary_weight/crash-1b454523d38a6c3f45d453dfea4099f3cb574822
+Base64: Xl5eXl5EAAAAAABdAQAAAAAAAF4KAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBpQEBAQ==
+────────────────────────────────────────────────────────────────────────────────
+
+Failing input:
+
+	fuzz/artifacts/units_arbitrary_weight/crash-1b454523d38a6c3f45d453dfea4099f3cb574822
+
+Output of `std::fmt::Debug`:
+
+	[94, 94, 94, 94, 94, 68, 0, 0, 0, 0, 0, 93, 1, 0, 0, 0, 0, 0, 0, 94, 10, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 165, 1, 1, 1]
+
+Reproduce with:
+
+	cargo fuzz run units_arbitrary_weight fuzz/artifacts/units_arbitrary_weight/crash-1b454523d38a6c3f45d453dfea4099f3cb574822
+
+Minimize test case with:
+
+	cargo fuzz tmin units_arbitrary_weight fuzz/artifacts/units_arbitrary_weight/crash-1b454523d38a6c3f45d453dfea4099f3cb574822
+
+────────────────────────────────────────────────────────────────────────────────
 ```
-
-The final line is a hex-encoded version of the input that caused the crash. You
-can test this directly by editing the `duplicate_crash` test to copy/paste the
-hex output into the call to `extend_vec_from_hex`. Then run the test with
-
-```bash
-cargo test
-```
-
-Note that if you set your `RUSTFLAGS` while fuzzing (see above) you must make
-sure they are set the same way when running `cargo test`.

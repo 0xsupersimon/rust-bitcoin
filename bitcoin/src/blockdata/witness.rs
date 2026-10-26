@@ -4,115 +4,20 @@
 //!
 //! This module contains the [`Witness`] struct and related methods to operate on it
 
-use internals::compact_size;
-use io::{BufRead, Write};
-
-use crate::consensus::encode::{self, Error, ReadExt, WriteExt, MAX_VEC_SIZE};
-use crate::consensus::{Decodable, Encodable};
 use crate::crypto::ecdsa;
-use crate::crypto::key::SerializedXOnlyPublicKey;
-use crate::prelude::Vec;
-#[cfg(doc)]
-use crate::script::ScriptExt as _;
+use crate::crypto::key::{FullPublicKey, SerializedXOnlyPublicKey};
 use crate::taproot::{self, ControlBlock, LeafScript, TaprootMerkleBranch, TAPROOT_ANNEX_PREFIX};
-use crate::Script;
+use crate::{internal_macros, TapScript, WitnessScript};
 
 type BorrowedControlBlock<'a> = ControlBlock<&'a TaprootMerkleBranch, &'a SerializedXOnlyPublicKey>;
 
 #[rustfmt::skip]                // Keep public re-exports separate.
 #[doc(inline)]
-pub use primitives::witness::{Iter, Witness};
+pub use primitives::witness::{error, Iter, Witness, WitnessDecoder, WitnessEncoder};
+#[doc(no_inline)]
+pub use primitives::witness::{UnexpectedEofError, WitnessDecoderError};
 
-impl Decodable for Witness {
-    fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, Error> {
-        let witness_elements = r.read_compact_size()? as usize;
-        // Minimum size of witness element is 1 byte, so if the count is
-        // greater than MAX_VEC_SIZE we must return an error.
-        if witness_elements > MAX_VEC_SIZE {
-            return Err(encode::ParseError::OversizedVectorAllocation {
-                requested: witness_elements,
-                max: MAX_VEC_SIZE,
-            }
-            .into());
-        }
-        if witness_elements == 0 {
-            Ok(Witness::default())
-        } else {
-            // Leave space at the head for element positions.
-            // We will rotate them to the end of the Vec later.
-            let witness_index_space = witness_elements * 4;
-            let mut cursor = witness_index_space;
-
-            // this number should be determined as high enough to cover most witness, and low enough
-            // to avoid wasting space without reallocating
-            let mut content = vec![0u8; cursor + 128];
-
-            for i in 0..witness_elements {
-                let element_size = r.read_compact_size()? as usize;
-                let element_size_len = compact_size::encoded_size(element_size);
-                let required_len = cursor
-                    .checked_add(element_size)
-                    .ok_or(encode::Error::Parse(encode::ParseError::OversizedVectorAllocation {
-                        requested: usize::MAX,
-                        max: MAX_VEC_SIZE,
-                    }))?
-                    .checked_add(element_size_len)
-                    .ok_or(encode::Error::Parse(encode::ParseError::OversizedVectorAllocation {
-                        requested: usize::MAX,
-                        max: MAX_VEC_SIZE,
-                    }))?;
-
-                if required_len > MAX_VEC_SIZE + witness_index_space {
-                    return Err(encode::ParseError::OversizedVectorAllocation {
-                        requested: required_len,
-                        max: MAX_VEC_SIZE,
-                    }
-                    .into());
-                }
-
-                // We will do content.rotate_left(witness_index_space) later.
-                // Encode the position's value AFTER we rotate left.
-                encode_cursor(&mut content, 0, i, cursor - witness_index_space);
-
-                resize_if_needed(&mut content, required_len);
-                cursor += (&mut content[cursor..cursor + element_size_len])
-                    .emit_compact_size(element_size)?;
-                r.read_exact(&mut content[cursor..cursor + element_size])?;
-                cursor += element_size;
-            }
-            content.truncate(cursor);
-            // Index space is now at the end of the Vec
-            content.rotate_left(witness_index_space);
-            let indices_start = cursor - witness_index_space;
-            Ok(Witness::from_parts__unstable(content, witness_elements, indices_start))
-        }
-    }
-}
-
-fn resize_if_needed(vec: &mut Vec<u8>, required_len: usize) {
-    if required_len >= vec.len() {
-        let mut new_len = vec.len().max(1);
-        while new_len <= required_len {
-            new_len *= 2;
-        }
-        vec.resize(new_len, 0);
-    }
-}
-
-impl Encodable for Witness {
-    // `self.content` includes the varints so encoding here includes them, as expected.
-    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
-        let mut written = w.emit_compact_size(self.len())?;
-
-        for element in self.iter() {
-            written += encode::consensus_encode_with_size(element, w)?
-        }
-
-        Ok(written)
-    }
-}
-
-crate::internal_macros::define_extension_trait! {
+internal_macros::define_extension_trait! {
     /// Extension functionality for the [`Witness`] type.
     pub trait WitnessExt impl for Witness {
         /// Constructs a new witness required to spend a P2WPKH output.
@@ -121,22 +26,37 @@ crate::internal_macros::define_extension_trait! {
         /// serialized public key. Also useful for spending a P2SH-P2WPKH output.
         ///
         /// It is expected that `pubkey` is related to the secret key used to create `signature`.
-        fn p2wpkh(signature: ecdsa::Signature, pubkey: secp256k1::PublicKey) -> Witness {
+        fn p2wpkh(signature: ecdsa::Signature, pubkey: FullPublicKey) -> Self {
             let mut witness = Witness::new();
             witness.push(signature.serialize());
-            witness.push(pubkey.serialize());
+            witness.push(pubkey.to_bytes());
+            witness
+        }
+
+        ///Constructs a new witness required to spend a P2WSH output.
+        ///
+        /// The witness will be made up of the satisfaction elements (signatures, preimages, etc.)
+        /// followed by the witness script as the last element. Also useful for spending a
+        /// P2SH-P2WSH output (with the appropriate scriptSig).
+        ///
+        /// The `satisfaction` slice should contain the script satisfaction stack items in the
+        /// order they are pushed onto the stack (e.g., `&[&[][..], &sig1[..], &sig2[..]]` for a
+        /// 2-of-3 multisig).
+        fn p2wsh(satisfaction: &[&[u8]], witness_script: &WitnessScript) -> Self {
+            let mut witness: Witness = satisfaction.iter().collect();
+            witness.push(witness_script.as_bytes());
             witness
         }
 
         /// Constructs a new witness required to do a key path spend of a P2TR output.
-        fn p2tr_key_spend(signature: &taproot::Signature) -> Witness {
+        fn p2tr_key_spend(signature: &taproot::Signature) -> Self {
             let mut witness = Witness::new();
             witness.push(signature.serialize());
             witness
         }
 
         /// Finishes constructing the P2TR script spend witness by pushing the required items.
-        fn push_p2tr_script_spend(&mut self, script: &Script, control_block: &ControlBlock<impl AsRef<TaprootMerkleBranch>>, annex: Option<&[u8]>) {
+        fn push_p2tr_script_spend(&mut self, script: &TapScript, control_block: &ControlBlock<impl AsRef<TaprootMerkleBranch>>, annex: Option<&[u8]>) {
             self.push(script.as_bytes());
             self.push(&*control_block.encode_to_arrayvec());
             if let Some(annex) = annex {
@@ -151,30 +71,31 @@ crate::internal_macros::define_extension_trait! {
             self.push(signature.serialize())
         }
 
-        /// Get Tapscript following BIP341 rules regarding accounting for an annex.
+        /// Returns the leaf script if this witness is a Taproot script spend.
         ///
-        /// This does not guarantee that this represents a P2TR [`Witness`]. It
-        /// merely gets the second to last or third to last element depending on
-        /// the first byte of the last element being equal to 0x50.
-        ///
-        /// See [`Script::is_p2tr`] to check whether this is actually a Taproot witness.
-        fn tapscript(&self) -> Option<&Script> {
+        /// **Deprecated** since this does not return the leaf version. Code that
+        /// assumes a leaf version may be subtly broken once a new Tapscript version
+        /// is deployed.
+        #[deprecated(since = "TBD", note = "use taproot_leaf_script instead")]
+        fn tapscript(&self) -> Option<&TapScript> {
             match P2TrSpend::from_witness(self) {
-                // Note: the method is named "tapscript" but historically it was actually returning
-                // leaf script. This is broken but we now keep the behavior the same to not subtly
-                // break someone.
                 Some(P2TrSpend::Script { leaf_script, .. }) => Some(leaf_script),
                 _ => None,
             }
         }
 
-        /// Returns the leaf script with its version but without the merkle proof.
+        /// Returns the leaf script and version if this witness is a Taproot script spend.
         ///
-        /// This does not guarantee that this represents a P2TR [`Witness`]. It
-        /// merely gets the second to last or third to last element depending on
-        /// the first byte of the last element being equal to 0x50 and the associated
-        /// version.
-        fn taproot_leaf_script(&self) -> Option<LeafScript<&Script>> {
+        /// This method does not include the control block or annex; to obtain those, call
+        /// [`Self::taproot_control_block`] and [`Self::taproot_annex`].
+        ///
+        /// Although this method does not have access to the output being spent, if the
+        /// transaction is valid and this method returns `Some`, you can be assured that
+        /// it is a real Taproot script spend (and not some other kind of output contrived
+        /// to have a Taproot-shaped witness).
+        /// See [BIP-0341](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki),
+        /// in particular footnote 7, for more information.
+        fn taproot_leaf_script(&self) -> Option<LeafScript<&TapScript>> {
             match P2TrSpend::from_witness(self) {
                 Some(P2TrSpend::Script { leaf_script, control_block, .. }) => {
                     Some(LeafScript { version: control_block.leaf_version, script: leaf_script, })
@@ -183,13 +104,14 @@ crate::internal_macros::define_extension_trait! {
             }
         }
 
-        /// Get the Taproot control block following BIP341 rules.
+        /// If this witness is a Taproot script spend, return the control block.
         ///
-        /// This does not guarantee that this represents a P2TR [`Witness`]. It
-        /// merely gets the last or second to last element depending on the first
-        /// byte of the last element being equal to 0x50.
-        ///
-        /// See [`Script::is_p2tr`] to check whether this is actually a Taproot witness.
+        /// Although this method does not have access to the output being spent, if the
+        /// transaction is valid and this method returns `Some`, you can be assured that
+        /// it is a real Taproot script spend (and not some other kind of output contrived
+        /// to have a Taproot-shaped witness).
+        /// See [BIP-0341](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki),
+        /// in particular footnote 7, for more information.
         fn taproot_control_block(&self) -> Option<BorrowedControlBlock<'_>> {
             match P2TrSpend::from_witness(self) {
                 Some(P2TrSpend::Script { control_block, .. }) => Some(control_block),
@@ -197,22 +119,18 @@ crate::internal_macros::define_extension_trait! {
             }
         }
 
-        /// Get the Taproot annex following BIP341 rules.
-        ///
-        /// This does not guarantee that this represents a P2TR [`Witness`].
-        ///
-        /// See [`Script::is_p2tr`] to check whether this is actually a Taproot witness.
+        /// If this witness is a Taproot script spend with an annex, return that.
         fn taproot_annex(&self) -> Option<&[u8]> {
             P2TrSpend::from_witness(self)?.annex()
         }
 
-        /// Get the p2wsh witness script following BIP141 rules.
+        /// Get the Segwit version 0 witness script.
         ///
-        /// This does not guarantee that this represents a P2WS [`Witness`].
-        ///
-        /// See [`Script::is_p2wsh`] to check whether this is actually a P2WSH witness.
-        fn witness_script(&self) -> Option<&Script> { self.last().map(Script::from_bytes) }
-
+        /// Unlike the Taproot case, we do no validation to determine whether this is a
+        /// witness script: it may be a Taproot control block, annex, or some other kind
+        /// of object. If you are not certain whether the output being spent is Segwit v0,
+        /// use [`crate::script::Script::is_p2wsh`] on the output's script.
+        fn witness_script(&self) -> Option<&WitnessScript> { self.last().map(WitnessScript::from_bytes) }
     }
 }
 
@@ -234,7 +152,7 @@ enum P2TrSpend<'a> {
         annex: Option<&'a [u8]>,
     },
     Script {
-        leaf_script: &'a Script,
+        leaf_script: &'a TapScript,
         control_block: BorrowedControlBlock<'a>,
         annex: Option<&'a [u8]>,
     },
@@ -251,7 +169,7 @@ impl<'a> P2TrSpend<'a> {
     /// obtained from Bitcoin Core) then it's OK to unwrap this but not vice versa - `Some` does
     /// not imply correctness.
     fn from_witness(witness: &'a Witness) -> Option<Self> {
-        // BIP341 says:
+        // BIP-0341 says:
         //   If there are at least two witness elements, and the first byte of
         //   the last element is 0x50, this last element is called annex a
         //   and is removed from the witness stack.
@@ -277,7 +195,7 @@ impl<'a> P2TrSpend<'a> {
                 let control_block = witness.get_back(1).expect("len > 1");
                 let control_block = BorrowedControlBlock::decode_borrowed(control_block).ok()?;
                 let spend = P2TrSpend::Script {
-                    leaf_script: Script::from_bytes(witness.get_back(2).expect("len > 2")),
+                    leaf_script: TapScript::from_bytes(witness.get_back(2).expect("len > 2")),
                     control_block,
                     annex: witness.last(),
                 };
@@ -287,7 +205,7 @@ impl<'a> P2TrSpend<'a> {
                 let control_block = witness.last().expect("len > 0");
                 let control_block = BorrowedControlBlock::decode_borrowed(control_block).ok()?;
                 let spend = P2TrSpend::Script {
-                    leaf_script: Script::from_bytes(witness.get_back(1).expect("len > 1")),
+                    leaf_script: TapScript::from_bytes(witness.get_back(1).expect("len > 1")),
                     control_block,
                     annex: None,
                 };
@@ -309,40 +227,17 @@ mod sealed {
     impl Sealed for super::Witness {}
 }
 
-/// Correctness Requirements: value must always fit within u32
-// This is duplicated in `primitives::witness`, if you change it please do so over there also.
-#[inline]
-fn encode_cursor(bytes: &mut [u8], start_of_indices: usize, index: usize, value: usize) {
-    let start = start_of_indices + index * 4;
-    let end = start + 4;
-    bytes[start..end]
-        .copy_from_slice(&u32::to_ne_bytes(value.try_into().expect("larger than u32")));
-}
-
 #[cfg(test)]
 mod test {
-    use hex_lit::hex;
+    use hex::{hex, DisplayHex};
 
     use super::*;
-    use crate::consensus::{deserialize, encode, serialize};
-    use crate::hex::DisplayHex;
+    use crate::encoding::{
+        decode_from_slice, drain_to_vec, encode_to_vec, BytesEncoder, CompactSizeEncoder, Encoder2,
+    };
     use crate::sighash::EcdsaSighashType;
     use crate::taproot::LeafVersion;
     use crate::Transaction;
-
-    #[test]
-    fn exact_sized_iterator() {
-        let mut witness = Witness::default();
-        for i in 0..5 {
-            assert_eq!(witness.iter().len(), i);
-            witness.push([0u8]);
-        }
-        let mut iter = witness.iter();
-        for i in (0..=5).rev() {
-            assert_eq!(iter.len(), i);
-            iter.next();
-        }
-    }
 
     #[test]
     fn push_ecdsa_sig() {
@@ -372,17 +267,26 @@ mod test {
         let vec = vec![el_0, el_1];
 
         // Puts a CompactSize at the front as well as one at the front of each element.
-        let want_ser: Vec<u8> = encode::serialize(&vec);
+        let want_ser = {
+            let mut out = drain_to_vec(&mut CompactSizeEncoder::new(vec.len()));
+            for item in &vec {
+                out.extend_from_slice(&drain_to_vec(&mut Encoder2::new(
+                    CompactSizeEncoder::new(item.len()),
+                    BytesEncoder::without_length_prefix(item),
+                )));
+            }
+            out
+        };
 
         // `from_slice` expects bytes slices _without_ leading `CompactSize`.
         let got_witness = Witness::from_slice(&vec);
         assert_eq!(got_witness, want_witness);
 
-        let got_ser = encode::serialize(&got_witness);
+        let got_ser = encode_to_vec(&got_witness);
         assert_eq!(got_ser, want_ser);
 
-        let rinsed: Witness = encode::deserialize(&got_ser).unwrap();
-        assert_eq!(rinsed, want_witness)
+        let roundtrip: Witness = decode_from_slice(&got_ser).unwrap();
+        assert_eq!(roundtrip, want_witness)
     }
 
     #[test]
@@ -397,8 +301,8 @@ mod test {
         let witness_annex = Witness::from([tapscript.as_slice(), &control_block, &annex]);
 
         // With or without annex, the tapscript should be returned.
-        assert_eq!(witness.tapscript(), Some(Script::from_bytes(&tapscript[..])));
-        assert_eq!(witness_annex.tapscript(), Some(Script::from_bytes(&tapscript[..])));
+        assert_eq!(witness.tapscript(), Some(TapScript::from_bytes(&tapscript[..])));
+        assert_eq!(witness_annex.tapscript(), Some(TapScript::from_bytes(&tapscript[..])));
     }
 
     #[test]
@@ -412,8 +316,10 @@ mod test {
         let witness = Witness::from([tapscript.as_slice(), &control_block]);
         let witness_annex = Witness::from([tapscript.as_slice(), &control_block, &annex]);
 
-        let expected_leaf_script =
-            LeafScript { version: LeafVersion::TapScript, script: Script::from_bytes(&tapscript) };
+        let expected_leaf_script = LeafScript {
+            version: LeafVersion::TapScript,
+            script: TapScript::from_bytes(&tapscript),
+        };
 
         // With or without annex, the tapscript should be returned.
         assert_eq!(witness.taproot_leaf_script().unwrap(), expected_leaf_script);
@@ -486,57 +392,51 @@ mod test {
     fn tx() {
         const S: &str = "02000000000102b44f26b275b8ad7b81146ba3dbecd081f9c1ea0dc05b97516f56045cfcd3df030100000000ffffffff1cb4749ae827c0b75f3d0a31e63efc8c71b47b5e3634a4c698cd53661cab09170100000000ffffffff020b3a0500000000001976a9143ea74de92762212c96f4dd66c4d72a4deb20b75788ac630500000000000016001493a8dfd1f0b6a600ab01df52b138cda0b82bb7080248304502210084622878c94f4c356ce49c8e33a063ec90f6ee9c0208540888cfab056cd1fca9022014e8dbfdfa46d318c6887afd92dcfa54510e057565e091d64d2ee3a66488f82c0121026e181ffb98ebfe5a64c983073398ea4bcd1548e7b971b4c175346a25a1c12e950247304402203ef00489a0d549114977df2820fab02df75bebb374f5eee9e615107121658cfa02204751f2d1784f8e841bff6d3bcf2396af2f1a5537c0e4397224873fbd3bfbe9cf012102ae6aa498ce2dd204e9180e71b4fb1260fe3d1a95c8025b34e56a9adf5f278af200000000";
         let tx_bytes = hex!(S);
-        let tx: Transaction = deserialize(&tx_bytes).unwrap();
+        let tx: Transaction = decode_from_slice(&tx_bytes).unwrap();
 
         let expected_wit = ["304502210084622878c94f4c356ce49c8e33a063ec90f6ee9c0208540888cfab056cd1fca9022014e8dbfdfa46d318c6887afd92dcfa54510e057565e091d64d2ee3a66488f82c01", "026e181ffb98ebfe5a64c983073398ea4bcd1548e7b971b4c175346a25a1c12e95"];
-        for (i, wit_el) in tx.input[0].witness.iter().enumerate() {
+        for (i, wit_el) in tx.inputs[0].witness.iter().enumerate() {
             assert_eq!(expected_wit[i], wit_el.to_lower_hex_string());
         }
-        assert_eq!(expected_wit[1], tx.input[0].witness.last().unwrap().to_lower_hex_string());
-        assert_eq!(expected_wit[0], tx.input[0].witness.get_back(1).unwrap().to_lower_hex_string());
-        assert_eq!(expected_wit[0], tx.input[0].witness.get(0).unwrap().to_lower_hex_string());
-        assert_eq!(expected_wit[1], tx.input[0].witness.get(1).unwrap().to_lower_hex_string());
-        assert_eq!(None, tx.input[0].witness.get(2));
-        assert_eq!(expected_wit[0], tx.input[0].witness[0].to_lower_hex_string());
-        assert_eq!(expected_wit[1], tx.input[0].witness[1].to_lower_hex_string());
+        assert_eq!(expected_wit[1], tx.inputs[0].witness.last().unwrap().to_lower_hex_string());
+        assert_eq!(
+            expected_wit[0],
+            tx.inputs[0].witness.get_back(1).unwrap().to_lower_hex_string()
+        );
+        assert_eq!(expected_wit[0], tx.inputs[0].witness.get(0).unwrap().to_lower_hex_string());
+        assert_eq!(expected_wit[1], tx.inputs[0].witness.get(1).unwrap().to_lower_hex_string());
+        assert_eq!(None, tx.inputs[0].witness.get(2));
+        assert_eq!(expected_wit[0], tx.inputs[0].witness[0].to_lower_hex_string());
+        assert_eq!(expected_wit[1], tx.inputs[0].witness[1].to_lower_hex_string());
 
-        let tx_bytes_back = serialize(&tx);
+        let tx_bytes_back = encode_to_vec(&tx);
         assert_eq!(tx_bytes_back, tx_bytes);
+    }
+
+    #[test]
+    fn p2wsh_witness() {
+        let witness_script_bytes = hex!("522103e5529d8eaa3d559903adb2e881eb06c86ac2574ffa503c45f4e942e2a693b33e2102e5f10fcdcdbab211e0af6a481f5532536ec61a5fdbf7183770cf8680fe729d8152ae");
+        let witness_script = WitnessScript::from_bytes(&witness_script_bytes);
+        let sig1 = hex!("304402201234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef02201234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef01");
+        let sig2 = hex!("3044022011111111111111111111111111111111111111111111111111111111111111110220222222222222222222222222222222222222222222222222222222222222222201");
+
+        // 2-of-2 multisig satisfaction: OP_0 bug push, then two sigs
+        let satisfaction: &[&[u8]] = &[&[], &sig1, &sig2];
+        let witness = Witness::p2wsh(satisfaction, witness_script);
+
+        assert_eq!(witness.len(), 4); // empty push + sig1 + sig2 + witness_script
+        assert_eq!(witness[0], *b"");
+        assert_eq!(witness[1], sig1[..]);
+        assert_eq!(witness[2], sig2[..]);
+        assert_eq!(witness[3], *witness_script.as_bytes());
     }
 
     #[test]
     fn fuzz_cases() {
         let bytes = hex!("26ff0000000000c94ce592cf7a4cbb68eb00ce374300000057cd0000000000000026");
-        assert!(deserialize::<Witness>(&bytes).is_err()); // OversizedVectorAllocation
+        assert!(decode_from_slice::<Witness>(&bytes).is_err()); // OversizedVectorAllocation
 
         let bytes = hex!("24000000ffffffffffffffffffffffff");
-        assert!(deserialize::<Witness>(&bytes).is_err()); // OversizedVectorAllocation
-    }
-}
-
-#[cfg(bench)]
-mod benches {
-    use test::{black_box, Bencher};
-
-    use super::{Witness, WitnessExt};
-
-    #[bench]
-    pub fn bench_big_witness_to_vec(bh: &mut Bencher) {
-        let raw_witness = [[1u8]; 5];
-        let witness = Witness::from_slice(&raw_witness);
-
-        bh.iter(|| {
-            black_box(witness.to_vec());
-        });
-    }
-
-    #[bench]
-    pub fn bench_witness_to_vec(bh: &mut Bencher) {
-        let raw_witness = vec![vec![1u8]; 3];
-        let witness = Witness::from_slice(&raw_witness);
-
-        bh.iter(|| {
-            black_box(witness.to_vec());
-        });
+        assert!(decode_from_slice::<Witness>(&bytes).is_err()); // OversizedVectorAllocation
     }
 }

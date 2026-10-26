@@ -1,8 +1,9 @@
-use bitcoin::script::{ScriptBufExt as _, ScriptExt as _};
+use bitcoin::ext::*;
 use bitcoin::{
-    consensus, ecdsa, sighash, Amount, CompressedPublicKey, Script, ScriptBuf, Transaction,
+    ecdsa, encoding, sighash, Amount, FullPublicKey, ScriptPubKey, ScriptPubKeyBuf, Transaction,
+    WitnessScript,
 };
-use hex_lit::hex;
+use hex::hex;
 
 //These are real blockchain transactions examples of computing sighash for:
 // - P2WPKH
@@ -16,16 +17,16 @@ use hex_lit::hex;
 ///
 /// # Parameters
 ///
-/// * `raw_tx` - spending tx hex
-/// * `inp_idx` - spending tx input index
-/// * `amount` - ref tx output value in sats
+/// * `raw_tx` - the spending tx hex
+/// * `inp_idx` - the spending tx input index
+/// * `amount` - the ref tx output amount.
 fn compute_sighash_p2wpkh(raw_tx: &[u8], inp_idx: usize, amount: Amount) {
-    let tx: Transaction = consensus::deserialize(raw_tx).unwrap();
-    let inp = &tx.input[inp_idx];
+    let tx: Transaction = encoding::decode_from_slice(raw_tx).unwrap();
+    let inp = &tx.inputs[inp_idx];
     let witness = &inp.witness;
     println!("Witness: {witness:?}");
 
-    // BIP-141: The witness must consist of exactly 2 items (≤ 520 bytes each). The first one a
+    // BIP-0141: The witness must consist of exactly 2 items (≤ 520 bytes each). The first one a
     // signature, and the second one a public key.
     assert_eq!(witness.len(), 2);
     let sig_bytes = witness.get(0).unwrap();
@@ -33,12 +34,13 @@ fn compute_sighash_p2wpkh(raw_tx: &[u8], inp_idx: usize, amount: Amount) {
 
     let sig = ecdsa::Signature::from_slice(sig_bytes).expect("failed to parse sig");
 
-    //BIP-143: "The item 5 : For P2WPKH witness program, the scriptCode is 0x1976a914{20-byte-pubkey-hash}88ac"
+    //BIP-0143: "The item 5 : For P2WPKH witness program, the scriptCode is 0x1976a914{20-byte-pubkey-hash}88ac"
     //this is nothing but a standard P2PKH script OP_DUP OP_HASH160 <pubKeyHash> OP_EQUALVERIFY OP_CHECKSIG:
-    let pk = CompressedPublicKey::from_slice(pk_bytes).expect("failed to parse pubkey");
+    let pk_byte_arr = pk_bytes.try_into().expect("there should be 33 bytes for a compressed key");
+    let pk = FullPublicKey::from_bytes(pk_byte_arr).expect("failed to parse pubkey");
     let wpkh = pk.wpubkey_hash();
     println!("Script pubkey hash: {wpkh:x}");
-    let spk = ScriptBuf::new_p2wpkh(wpkh);
+    let spk = ScriptPubKeyBuf::new_p2wpkh(wpkh);
 
     let mut cache = sighash::SighashCache::new(&tx);
     let sighash = cache
@@ -47,20 +49,19 @@ fn compute_sighash_p2wpkh(raw_tx: &[u8], inp_idx: usize, amount: Amount) {
     println!("SegWit p2wpkh sighash: {sighash:x}");
     let msg = secp256k1::Message::from(sighash);
     println!("Message is {msg:x}");
-    let secp = secp256k1::Secp256k1::verification_only();
-    pk.verify(&secp, msg, sig).unwrap()
+    pk.verify(msg, sig).unwrap()
 }
 
 /// Computes sighash for a legacy multisig transaction input that spends either a p2sh or a p2ms output.
 ///
 /// # Parameters
 ///
-/// * `raw_tx` - spending tx hex
-/// * `inp_idx` - spending tx input index
-/// * `script_pubkey_bytes_opt` - Option with scriptPubKey bytes. If None, it's p2sh case, i.e., reftx output's scriptPubKey.type is "scripthash". In this case scriptPubkey is extracted from the spending transaction's scriptSig. If Some(), it's p2ms case, i.e., reftx output's scriptPubKey.type is "multisig", and the scriptPubkey is supplied from the referenced output.
+/// * `raw_tx` - the spending tx hex
+/// * `inp_idx` - the spending tx input index
+/// * `script_pubkey_bytes_opt` - the Option with scriptPubKey bytes. If None, it's p2sh case, i.e., reftx output's scriptPubKey.type is "scripthash". In this case scriptPubkey is extracted from the spending transaction's scriptSig. If Some(), it's p2ms case, i.e., reftx output's scriptPubKey.type is "multisig", and the scriptPubkey is supplied from the referenced output.
 fn compute_sighash_legacy(raw_tx: &[u8], inp_idx: usize, script_pubkey_bytes_opt: Option<&[u8]>) {
-    let tx: Transaction = consensus::deserialize(raw_tx).unwrap();
-    let inp = &tx.input[inp_idx];
+    let tx: Transaction = encoding::decode_from_slice(raw_tx).unwrap();
+    let inp = &tx.inputs[inp_idx];
     let script_sig = &inp.script_sig;
     println!("scriptSig is: {script_sig}");
     let cache = sighash::SighashCache::new(&tx);
@@ -78,19 +79,19 @@ fn compute_sighash_legacy(raw_tx: &[u8], inp_idx: usize, script_pubkey_bytes_opt
             script_pubkey_p2sh.push_bytes().unwrap().as_bytes()
         }
     };
-    let script_code = Script::from_bytes(script_pubkey_bytes);
+    let script_code = ScriptPubKey::from_bytes(script_pubkey_bytes);
     let pushbytes_0 = instructions.remove(0).unwrap();
     assert!(
         pushbytes_0.push_bytes().unwrap().as_bytes().is_empty(),
         "first in ScriptSig must be PUSHBYTES_0 got {pushbytes_0:?}"
     );
 
-    //All other scriptSig instructions  must be signatures
+    //All other scriptSig instructions must be signatures
     for instr in instructions {
         let sig = ecdsa::Signature::from_slice(instr.unwrap().push_bytes().unwrap().as_bytes())
             .expect("failed to parse sig");
         let sighash = cache
-            .legacy_signature_hash(inp_idx, script_code, sig.sighash_type.to_u32())
+            .legacy_signature_hash(inp_idx, script_code, sig.sighash_type)
             .expect("failed to compute sighash");
         println!("Legacy sighash: {:x} (sighash flag {})", sighash, sig.sighash_type);
     }
@@ -100,18 +101,18 @@ fn compute_sighash_legacy(raw_tx: &[u8], inp_idx: usize, script_pubkey_bytes_opt
 ///
 /// # Parameters
 ///
-/// * `raw_tx` - spending tx hex
-/// * `inp_idx` - spending tx input index
-/// * `amount` - ref tx output value in sats
+/// * `raw_tx` - the spending tx hex
+/// * `inp_idx` - the spending tx input index
+/// * `amount` - the ref tx output amount.
 fn compute_sighash_p2wsh(raw_tx: &[u8], inp_idx: usize, amount: Amount) {
-    let tx: Transaction = consensus::deserialize(raw_tx).unwrap();
-    let inp = &tx.input[inp_idx];
+    let tx: Transaction = encoding::decode_from_slice(raw_tx).unwrap();
+    let inp = &tx.inputs[inp_idx];
     let witness = &inp.witness;
     println!("witness {witness:?}");
 
-    //last element is called witnessScript according to BIP141. It supersedes scriptPubKey.
+    //last element is called witnessScript according to BIP-0141. It supersedes scriptPubKey.
     let witness_script_bytes: &[u8] = witness.last().expect("out of bounds");
-    let witness_script = Script::from_bytes(witness_script_bytes);
+    let witness_script = WitnessScript::from_bytes(witness_script_bytes);
     let mut cache = sighash::SighashCache::new(&tx);
 
     //in an M of N multisig, the witness elements from 1 (0-based) to M-2 are signatures (with sighash flags as the last byte)
@@ -144,12 +145,12 @@ fn sighash_p2wpkh() {
 
     //vin:0
     let inp_idx = 0;
-    //output value from the referenced vout:0 from the referenced tx:
+    //output amount from the referenced vout:0 from the referenced tx:
     //bitcoin-cli getrawtransaction 752d675b9cc0bd14e0bd23969effee0005ad6d7e550dcc832f0216c7ffd4e15c  3
-    let ref_out_value = Amount::from_sat_u32(200000000);
+    let ref_out_amount = Amount::from_sat_u32(200000000);
 
     println!("\nsighash_p2wpkh:");
-    compute_sighash_p2wpkh(&raw_tx, inp_idx, ref_out_value);
+    compute_sighash_p2wpkh(&raw_tx, inp_idx, ref_out_amount);
 }
 
 fn sighash_p2sh_multisig_2x2() {
@@ -173,13 +174,13 @@ fn sighash_p2wsh_multisig_2x2() {
     //bitcoin-cli decodescript 52210289da5da9d3700156db2d01e6362491733f6c886971791deda74b4e9d707190b2210323c437f30384498be79df2990ce5a8de00844e768c0ccce914335b6c26adea7352ae
     //its ASM is 2 0289da5da9d3700156db2d01e6362491733f6c886971791deda74b4e9d707190b2 0323c437f30384498be79df2990ce5a8de00844e768c0ccce914335b6c26adea73 2 OP_CHECKMULTISIG
     let raw_tx = hex!("010000000001011b9eb4122976fad8f809ee4cea8ac8d1c5b6b8e0d0f9f93327a5d78c9a3945280000000000ffffffff02ba3e0d00000000002200201c3b09401aaa7c9709d118a75d301bdb2180fb68b2e9b3ade8ad4ff7281780cfa586010000000000220020a41d0d894799879ca1bd88c1c3f1c2fd4b1592821cc3c5bfd5be5238b904b09f040047304402201c7563e876d67b5702aea5726cd202bf92d0b1dc52c4acd03435d6073e630bac022032b64b70d7fba0cb8be30b882ea06c5f8ec7288d113459dd5d3e294214e2c96201483045022100f532f7e3b8fd01a0edc86de4870db4e04858964d0a609df81deb99d9581e6c2e02206d9e9b6ab661176be8194faded62f518cdc6ee74dba919e0f35d77cff81f38e5014752210289da5da9d3700156db2d01e6362491733f6c886971791deda74b4e9d707190b2210323c437f30384498be79df2990ce5a8de00844e768c0ccce914335b6c26adea7352ae00000000");
-    //For the witness transaction sighash computation, we need its referenced output's value from the original transaction:
+    //For the witness transaction sighash computation, we need its referenced output's amount from the original transaction:
     //bitcoin-cli getrawtransaction 2845399a8cd7a52733f9f9d0e0b8b6c5d1c88aea4cee09f8d8fa762912b49e1b  3
-    //we need vout 0 value in sats:
-    let ref_out_value = Amount::from_sat_u32(968240);
+    //we need vout 0 amount:
+    let ref_out_amount = Amount::from_sat_u32(968240);
 
     println!("\nsighash_p2wsh_multisig_2x2:");
-    compute_sighash_p2wsh(&raw_tx, 0, ref_out_value);
+    compute_sighash_p2wsh(&raw_tx, 0, ref_out_amount);
 }
 
 fn sighash_p2ms_multisig_2x3() {

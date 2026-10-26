@@ -25,43 +25,11 @@
 #[cfg(feature = "alloc")]
 use core::fmt;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sealed::Token;
 
-#[cfg(feature = "alloc")] // This is because `to_float_in` uses `to_string`.
-use super::Denomination;
 #[cfg(feature = "alloc")]
 use super::ParseAmountError;
-use super::{Amount, SignedAmount};
-
-/// This trait is used only to avoid code duplication and naming collisions
-/// of the different serde serialization crates.
-pub trait SerdeAmount: Copy + Sized {
-    fn ser_sat<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error>;
-    fn des_sat<'d, D: Deserializer<'d>>(d: D, _: private::Token) -> Result<Self, D::Error>;
-    #[cfg(feature = "alloc")]
-    fn ser_btc<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error>;
-    #[cfg(feature = "alloc")]
-    fn des_btc<'d, D: Deserializer<'d>>(d: D, _: private::Token) -> Result<Self, D::Error>;
-    #[cfg(feature = "alloc")]
-    fn ser_str<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error>;
-    #[cfg(feature = "alloc")]
-    fn des_str<'d, D: Deserializer<'d>>(d: D, _: private::Token) -> Result<Self, D::Error>;
-}
-
-mod private {
-    /// Controls access to the trait methods.
-    pub struct Token;
-}
-
-/// This trait is only for internal Amount type serialization/deserialization
-pub trait SerdeAmountForOpt: Copy + Sized + SerdeAmount {
-    fn type_prefix(_: private::Token) -> &'static str;
-    fn ser_sat_opt<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error>;
-    #[cfg(feature = "alloc")]
-    fn ser_btc_opt<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error>;
-    #[cfg(feature = "alloc")]
-    fn ser_str_opt<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error>;
-}
+use crate::{Amount, SignedAmount};
 
 #[cfg(feature = "alloc")]
 struct DisplayFullError(ParseAmountError);
@@ -81,196 +49,330 @@ impl fmt::Display for DisplayFullError {
     }
 }
 
-#[cfg(not(feature = "std"))]
 #[cfg(feature = "alloc")]
+#[cfg(not(feature = "std"))]
 impl fmt::Display for DisplayFullError {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
 }
 
-impl SerdeAmount for Amount {
-    fn ser_sat<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error> {
-        u64::serialize(&self.to_sat(), s)
-    }
-    fn des_sat<'d, D: Deserializer<'d>>(d: D, _: private::Token) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        Amount::from_sat(u64::deserialize(d)?).map_err(D::Error::custom)
-    }
-    #[cfg(feature = "alloc")]
-    fn ser_btc<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error> {
-        f64::serialize(&self.to_float_in(Denomination::Bitcoin), s)
-    }
-    #[cfg(feature = "alloc")]
-    fn des_btc<'d, D: Deserializer<'d>>(d: D, _: private::Token) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        Amount::from_btc(f64::deserialize(d)?).map_err(DisplayFullError).map_err(D::Error::custom)
-    }
-    #[cfg(feature = "alloc")]
-    fn ser_str<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.to_string_in(Denomination::Bitcoin))
-    }
-    #[cfg(feature = "alloc")]
-    fn des_str<'d, D: Deserializer<'d>>(d: D, _: private::Token) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        let s: alloc::string::String = Deserialize::deserialize(d)?;
-        Amount::from_str_in(&s, Denomination::Bitcoin)
-            .map_err(DisplayFullError)
-            .map_err(D::Error::custom)
-    }
-}
+/// Amount types accepted by [`as_sat`], [`as_btc`] and [`as_str`].
+pub trait AmountOps: TryFrom<SignedAmount> + Into<SignedAmount> + Copy + sealed::AmountOps {}
 
-impl SerdeAmountForOpt for Amount {
-    fn type_prefix(_: private::Token) -> &'static str { "u" }
-    fn ser_sat_opt<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error> {
-        s.serialize_some(&self.to_sat())
-    }
-    #[cfg(feature = "alloc")]
-    fn ser_btc_opt<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error> {
-        s.serialize_some(&self.to_btc())
-    }
-    #[cfg(feature = "alloc")]
-    fn ser_str_opt<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error> {
-        s.serialize_some(&self.to_string_in(Denomination::Bitcoin))
-    }
-}
+impl AmountOps for Amount {}
+impl AmountOps for SignedAmount {}
 
-impl SerdeAmount for SignedAmount {
-    fn ser_sat<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error> {
-        i64::serialize(&self.to_sat(), s)
-    }
-    fn des_sat<'d, D: Deserializer<'d>>(d: D, _: private::Token) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        SignedAmount::from_sat(i64::deserialize(d)?).map_err(D::Error::custom)
-    }
-    #[cfg(feature = "alloc")]
-    fn ser_btc<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error> {
-        f64::serialize(&self.to_float_in(Denomination::Bitcoin), s)
-    }
-    #[cfg(feature = "alloc")]
-    fn des_btc<'d, D: Deserializer<'d>>(d: D, _: private::Token) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        SignedAmount::from_btc(f64::deserialize(d)?)
-            .map_err(DisplayFullError)
-            .map_err(D::Error::custom)
-    }
-    #[cfg(feature = "alloc")]
-    fn ser_str<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error> {
-        s.serialize_str(self.to_string_in(Denomination::Bitcoin).as_str())
-    }
-    #[cfg(feature = "alloc")]
-    fn des_str<'d, D: Deserializer<'d>>(d: D, _: private::Token) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        let s: alloc::string::String = Deserialize::deserialize(d)?;
-        SignedAmount::from_str_in(&s, Denomination::Bitcoin)
-            .map_err(DisplayFullError)
-            .map_err(D::Error::custom)
-    }
-}
+#[allow(private_interfaces)]
+mod sealed {
+    use crate::{Amount, SignedAmount};
 
-impl SerdeAmountForOpt for SignedAmount {
-    fn type_prefix(_: private::Token) -> &'static str { "i" }
-    fn ser_sat_opt<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error> {
-        s.serialize_some(&self.to_sat())
+    pub trait AmountOps {
+        #[doc(hidden)]
+        fn is_signed(token: Token) -> bool;
     }
-    #[cfg(feature = "alloc")]
-    fn ser_btc_opt<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error> {
-        s.serialize_some(&self.to_btc())
+
+    impl AmountOps for Amount {
+        fn is_signed(_: Token) -> bool { false }
     }
-    #[cfg(feature = "alloc")]
-    fn ser_str_opt<S: Serializer>(self, s: S, _: private::Token) -> Result<S::Ok, S::Error> {
-        s.serialize_some(&self.to_string_in(Denomination::Bitcoin))
+
+    impl AmountOps for SignedAmount {
+        fn is_signed(_: Token) -> bool { true }
     }
+
+    #[doc(hidden)]
+    pub(super) struct Token;
 }
 
 pub mod as_sat {
-    //! Serialize and deserialize [`Amount`](crate::Amount) as real numbers denominated in satoshi.
+    //! Serialize and deserialize [`Amount`] and [`SignedAmount`] as real numbers denominated in satoshi.
+    //!
     //! Use with `#[serde(with = "amount::serde::as_sat")]`.
+    //!
+    //! [`Amount`]: crate::Amount
+    //! [`SignedAmount`]: crate::SignedAmount
 
-    use serde::{Deserializer, Serializer};
+    use core::fmt;
+    use core::marker::PhantomData;
 
-    use super::private;
-    use crate::amount::serde::SerdeAmount;
+    use serde::{Deserializer, Serialize, Serializer};
 
-    pub fn serialize<A: SerdeAmount, S: Serializer>(a: &A, s: S) -> Result<S::Ok, S::Error> {
-        a.ser_sat(s, private::Token)
+    use super::AmountOps;
+    use crate::SignedAmount;
+
+    #[inline]
+    pub fn serialize<A, S: Serializer>(a: &A, s: S) -> Result<S::Ok, S::Error>
+    where
+        A: AmountOps,
+    {
+        let sat = (*a).into().to_sat();
+        if A::is_signed(super::Token) {
+            i64::serialize(&sat, s)
+        } else {
+            u64::serialize(&(sat as u64), s)
+        }
     }
 
-    pub fn deserialize<'d, A: SerdeAmount, D: Deserializer<'d>>(d: D) -> Result<A, D::Error> {
-        A::des_sat(d, private::Token)
+    #[inline]
+    pub fn deserialize<'d, A, D: Deserializer<'d>>(d: D) -> Result<A, D::Error>
+    where
+        A: AmountOps,
+    {
+        fn expecting<T: AmountOps>() -> &'static str {
+            if T::is_signed(super::Token) {
+                "an integer between -2100000000000000 and 2100000000000000 inclusive"
+            } else {
+                "an integer between 0 and 2100000000000000 inclusive"
+            }
+        }
+
+        // We use custom visitor to have better control over error messages
+        struct Visitor<T>(PhantomData<fn() -> T>);
+
+        impl<'de, T> serde::de::Visitor<'de> for Visitor<T>
+        where
+            T: AmountOps,
+        {
+            type Value = T;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str(expecting::<T>())
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                fn range_error<T, E1, E2: serde::de::Error>(value: i64) -> impl FnOnce(E1) -> E2
+                where
+                    T: AmountOps,
+                {
+                    move |_| {
+                        let unexpected = serde::de::Unexpected::Signed(value);
+                        E2::invalid_value(unexpected, &expecting::<T>())
+                    }
+                }
+
+                SignedAmount::from_sat(value)
+                    .map_err(range_error::<T, _, _>(value))?
+                    .try_into()
+                    .map_err(range_error::<T, _, _>(value))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                fn range_error<T, E1, E2: serde::de::Error>(value: u64) -> impl FnOnce(E1) -> E2
+                where
+                    T: AmountOps,
+                {
+                    move |_| {
+                        let unexpected = serde::de::Unexpected::Unsigned(value);
+                        E2::invalid_value(unexpected, &expecting::<T>())
+                    }
+                }
+
+                let signed = i64::try_from(value).map_err(range_error::<T, _, _>(value))?;
+                SignedAmount::from_sat(signed)
+                    .map_err(range_error::<T, _, _>(value))?
+                    .try_into()
+                    .map_err(range_error::<T, _, _>(value))
+            }
+        }
+        if A::is_signed(super::Token) {
+            d.deserialize_i64(Visitor(PhantomData))
+        } else {
+            d.deserialize_u64(Visitor(PhantomData))
+        }
     }
 
     pub mod opt {
-        //! Serialize and deserialize [`Option<Amount>`](crate::Amount) as real numbers denominated in satoshi.
+        //! Serialize and deserialize [`Option<Amount>`] and [`Option<SignedAmount>`] as real
+        //! numbers denominated in satoshi.
+        //!
         //! Use with `#[serde(default, with = "amount::serde::as_sat::opt")]`.
 
         use core::fmt;
         use core::marker::PhantomData;
 
-        use serde::{de, Deserializer, Serializer};
+        use serde::{de, Deserializer, Serialize, Serializer};
 
-        use super::private;
-        use crate::amount::serde::SerdeAmountForOpt;
+        use crate::amount::serde::AmountOps;
+        use crate::SignedAmount;
 
+        #[inline]
         #[allow(clippy::ref_option)] // API forced by serde.
-        pub fn serialize<A: SerdeAmountForOpt, S: Serializer>(
-            a: &Option<A>,
-            s: S,
-        ) -> Result<S::Ok, S::Error> {
-            match *a {
-                Some(a) => a.ser_sat_opt(s, private::Token),
-                None => s.serialize_none(),
+        pub fn serialize<A, S: Serializer>(a: &Option<A>, s: S) -> Result<S::Ok, S::Error>
+        where
+            A: AmountOps,
+        {
+            let sat = a.map(Into::into).map(SignedAmount::to_sat);
+            if A::is_signed(super::super::Token) {
+                sat.serialize(s)
+            } else {
+                sat.map(|sat| sat as u64).serialize(s)
             }
         }
 
-        pub fn deserialize<'d, A: SerdeAmountForOpt, D: Deserializer<'d>>(
-            d: D,
-        ) -> Result<Option<A>, D::Error> {
+        pub fn deserialize<'d, A, D: Deserializer<'d>>(d: D) -> Result<Option<A>, D::Error>
+        where
+            A: AmountOps,
+        {
+            fn expecting<T: AmountOps>() -> &'static str {
+                if T::is_signed(super::super::Token) {
+                    "an optional integer between -2100000000000000 and 2100000000000000 inclusive"
+                } else {
+                    "an optional integer between 0 and 2100000000000000 inclusive"
+                }
+            }
+
             struct VisitOptAmt<X>(PhantomData<X>);
 
-            impl<'de, X: SerdeAmountForOpt> de::Visitor<'de> for VisitOptAmt<X> {
+            impl<'de, X> de::Visitor<'de> for VisitOptAmt<X>
+            where
+                X: AmountOps,
+            {
                 type Value = Option<X>;
 
                 fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                    write!(formatter, "an Option<{}64>", X::type_prefix(private::Token))
+                    formatter.write_str(expecting::<X>())
                 }
 
+                #[inline]
                 fn visit_none<E>(self) -> Result<Self::Value, E>
                 where
                     E: de::Error,
                 {
                     Ok(None)
                 }
+
+                #[inline]
                 fn visit_some<D>(self, d: D) -> Result<Self::Value, D::Error>
                 where
                     D: Deserializer<'de>,
                 {
-                    Ok(Some(X::des_sat(d, private::Token)?))
+                    Ok(Some(super::deserialize(d)?))
                 }
             }
             d.deserialize_option(VisitOptAmt::<A>(PhantomData))
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    pub mod vec {
+        //! Serialize and deserialize [`Vec<Amount>`] and [`Vec<SignedAmount>`] as real numbers
+        //! denominated in satoshi.
+        //!
+        //! Use with `#[serde(with = "amount::serde::as_sat::vec")]`.
+        //!
+        //! [`Vec<Amount>`]: crate::Amount
+        //! [`Vec<SignedAmount>`]: crate::SignedAmount
+
+        use alloc::vec::Vec;
+        use core::fmt;
+        use core::marker::PhantomData;
+
+        use serde::de::{self, SeqAccess};
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        use crate::amount::serde::AmountOps;
+        use crate::SignedAmount;
+
+        #[inline]
+        pub fn serialize<A, S: Serializer>(a: &[A], s: S) -> Result<S::Ok, S::Error>
+        where
+            A: AmountOps,
+        {
+            let sats = a.iter().map(|&amount| amount.into()).map(SignedAmount::to_sat);
+            if A::is_signed(super::super::Token) {
+                s.collect_seq(sats)
+            } else {
+                s.collect_seq(sats.map(|sat| sat as u64))
+            }
+        }
+
+        pub fn deserialize<'d, A, D: Deserializer<'d>>(d: D) -> Result<Vec<A>, D::Error>
+        where
+            A: AmountOps,
+        {
+            fn expecting<T: AmountOps>() -> &'static str {
+                if T::is_signed(super::super::Token) {
+                    "an sequence of integers between -2100000000000000 and 2100000000000000 inclusive"
+                } else {
+                    "an sequence of integers between 0 and 2100000000000000 inclusive"
+                }
+            }
+
+            struct VisitVec<X>(PhantomData<X>);
+
+            impl<'de, X> de::Visitor<'de> for VisitVec<X>
+            where
+                X: AmountOps,
+            {
+                type Value = Vec<X>;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str(expecting::<X>())
+                }
+
+                fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                where
+                    A: SeqAccess<'de>,
+                {
+                    #[derive(Deserialize)]
+                    #[serde(transparent)]
+                    struct Wrapper<T: AmountOps>(#[serde(with = "super")] T);
+
+                    let mut out = Vec::with_capacity(internals::serde::cautious_size_hint::<X>(
+                        seq.size_hint(),
+                    ));
+                    while let Some(wrapped) = seq.next_element::<Wrapper<X>>()? {
+                        out.push(wrapped.0);
+                    }
+                    Ok(out)
+                }
+            }
+
+            d.deserialize_seq(VisitVec::<A>(PhantomData))
         }
     }
 }
 
 #[cfg(feature = "alloc")]
 pub mod as_btc {
-    //! Serialize and deserialize [`Amount`](crate::Amount) as JSON numbers denominated in BTC.
+    //! Serialize and deserialize [`Amount`] and [`SignedAmount`] as JSON numbers denominated in BTC.
+    //!
     //! Use with `#[serde(with = "amount::serde::as_btc")]`.
+    //!
+    //! [`Amount`]: crate::Amount
+    //! [`SignedAmount`]: crate::SignedAmount
 
-    use serde::{Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    use super::private;
-    use crate::amount::serde::SerdeAmount;
+    use super::{AmountOps, DisplayFullError};
+    use crate::amount::{Denomination, SignedAmount};
 
-    pub fn serialize<A: SerdeAmount, S: Serializer>(a: &A, s: S) -> Result<S::Ok, S::Error> {
-        a.ser_btc(s, private::Token)
+    #[inline]
+    pub fn serialize<A, S: Serializer>(a: &A, s: S) -> Result<S::Ok, S::Error>
+    where
+        A: AmountOps,
+    {
+        let amount: SignedAmount = (*a).into();
+        f64::serialize(&amount.to_float_in(Denomination::Bitcoin), s)
     }
 
-    pub fn deserialize<'d, A: SerdeAmount, D: Deserializer<'d>>(d: D) -> Result<A, D::Error> {
-        A::des_btc(d, private::Token)
+    #[inline]
+    pub fn deserialize<'d, A, D: Deserializer<'d>>(d: D) -> Result<A, D::Error>
+    where
+        A: AmountOps,
+        A::Error: core::fmt::Display,
+    {
+        let btc = f64::deserialize(d)?;
+        let amount = SignedAmount::from_btc(btc)
+            .map_err(DisplayFullError)
+            .map_err(serde::de::Error::custom)?;
+
+        A::try_from(amount).map_err(serde::de::Error::custom)
     }
 
     pub mod opt {
-        //! Serialize and deserialize `Option<Amount>` as JSON numbers denominated in BTC.
+        //! Serialize and deserialize [`Option<Amount>`] and [`Option<SignedAmount>`] as JSON
+        //! numbers denominated in BTC.
+        //!
         //! Use with `#[serde(default, with = "amount::serde::as_btc::opt")]`.
 
         use core::fmt;
@@ -278,70 +380,173 @@ pub mod as_btc {
 
         use serde::{de, Deserializer, Serializer};
 
-        use super::private;
-        use crate::amount::serde::SerdeAmountForOpt;
+        use crate::amount::serde::AmountOps;
+        use crate::amount::Denomination;
 
+        #[inline]
         #[allow(clippy::ref_option)] // API forced by serde.
-        pub fn serialize<A: SerdeAmountForOpt, S: Serializer>(
-            a: &Option<A>,
-            s: S,
-        ) -> Result<S::Ok, S::Error> {
-            match *a {
-                Some(a) => a.ser_btc_opt(s, private::Token),
+        pub fn serialize<A, S: Serializer>(a: &Option<A>, s: S) -> Result<S::Ok, S::Error>
+        where
+            A: AmountOps,
+        {
+            match a.map(Into::into).map(|amt| amt.to_float_in(Denomination::Bitcoin)) {
+                Some(a) => s.serialize_some(&a),
                 None => s.serialize_none(),
             }
         }
 
-        pub fn deserialize<'d, A: SerdeAmountForOpt, D: Deserializer<'d>>(
-            d: D,
-        ) -> Result<Option<A>, D::Error> {
+        pub fn deserialize<'d, A, D: Deserializer<'d>>(d: D) -> Result<Option<A>, D::Error>
+        where
+            A: AmountOps,
+            A::Error: core::fmt::Display,
+        {
             struct VisitOptAmt<X>(PhantomData<X>);
 
-            impl<'de, X: SerdeAmountForOpt> de::Visitor<'de> for VisitOptAmt<X> {
+            impl<'de, X> de::Visitor<'de> for VisitOptAmt<X>
+            where
+                X: AmountOps,
+                X::Error: core::fmt::Display,
+            {
                 type Value = Option<X>;
 
                 fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
                     write!(formatter, "an Option<f64>")
                 }
 
+                #[inline]
                 fn visit_none<E>(self) -> Result<Self::Value, E>
                 where
                     E: de::Error,
                 {
                     Ok(None)
                 }
+
+                #[inline]
                 fn visit_some<D>(self, d: D) -> Result<Self::Value, D::Error>
                 where
                     D: Deserializer<'de>,
                 {
-                    Ok(Some(X::des_btc(d, private::Token)?))
+                    Ok(Some(super::deserialize(d)?))
                 }
             }
             d.deserialize_option(VisitOptAmt::<A>(PhantomData))
+        }
+    }
+
+    pub mod vec {
+        //! Serialize and deserialize [`Vec<Amount>`] and [`Vec<SignedAmount>`] as JSON numbers
+        //! denominated in BTC.
+        //!
+        //! Use with `#[serde(with = "amount::serde::as_btc::vec")]`.
+        //!
+        //! [`Vec<Amount>`]: crate::Amount
+        //! [`Vec<SignedAmount>`]: crate::SignedAmount
+
+        use alloc::vec::Vec;
+        use core::fmt;
+        use core::marker::PhantomData;
+
+        use serde::de::{self, SeqAccess};
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        use crate::amount::serde::AmountOps;
+        use crate::amount::{Denomination, SignedAmount};
+
+        #[inline]
+        pub fn serialize<A, S: Serializer>(a: &[A], s: S) -> Result<S::Ok, S::Error>
+        where
+            A: AmountOps,
+        {
+            s.collect_seq(a.iter().map(|amount| {
+                let signed_amount: SignedAmount = (*amount).into();
+                signed_amount.to_float_in(Denomination::Bitcoin)
+            }))
+        }
+
+        pub fn deserialize<'d, A, D: Deserializer<'d>>(d: D) -> Result<Vec<A>, D::Error>
+        where
+            A: AmountOps,
+            A::Error: core::fmt::Display,
+        {
+            struct VisitVec<X>(PhantomData<X>);
+
+            impl<'de, X> de::Visitor<'de> for VisitVec<X>
+            where
+                X: AmountOps,
+                X::Error: core::fmt::Display,
+            {
+                type Value = Vec<X>;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    write!(f, "a sequence of f64")
+                }
+
+                fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                where
+                    A: SeqAccess<'de>,
+                {
+                    #[derive(Deserialize)]
+                    #[serde(transparent)]
+                    struct Wrapper(#[serde(with = "super")] SignedAmount);
+
+                    let mut out = Vec::with_capacity(internals::serde::cautious_size_hint::<X>(
+                        seq.size_hint(),
+                    ));
+                    while let Some(wrapped) = seq.next_element::<Wrapper>()? {
+                        out.push(X::try_from(wrapped.0).map_err(de::Error::custom)?);
+                    }
+                    Ok(out)
+                }
+            }
+
+            d.deserialize_seq(VisitVec::<A>(PhantomData))
         }
     }
 }
 
 #[cfg(feature = "alloc")]
 pub mod as_str {
-    //! Serialize and deserialize [`Amount`](crate::Amount) as a JSON string denominated in BTC.
+    //! Serialize and deserialize [`Amount`] and [`SignedAmount`] as a JSON string denominated in BTC.
+    //!
     //! Use with `#[serde(with = "amount::serde::as_str")]`.
+    //!
+    //! [`Amount`]: crate::Amount
+    //! [`SignedAmount`]: crate::SignedAmount
 
-    use serde::{Deserializer, Serializer};
+    use alloc::string::String;
 
-    use super::private;
-    use crate::amount::serde::SerdeAmount;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    pub fn serialize<A: SerdeAmount, S: Serializer>(a: &A, s: S) -> Result<S::Ok, S::Error> {
-        a.ser_str(s, private::Token)
+    use super::{AmountOps, DisplayFullError};
+    use crate::amount::{Denomination, SignedAmount};
+
+    #[inline]
+    pub fn serialize<A, S: Serializer>(a: &A, s: S) -> Result<S::Ok, S::Error>
+    where
+        A: AmountOps,
+    {
+        let amount: SignedAmount = (*a).into();
+        str::serialize(&amount.to_string_in(Denomination::Bitcoin), s)
     }
 
-    pub fn deserialize<'d, A: SerdeAmount, D: Deserializer<'d>>(d: D) -> Result<A, D::Error> {
-        A::des_str(d, private::Token)
+    #[inline]
+    pub fn deserialize<'d, A, D: Deserializer<'d>>(d: D) -> Result<A, D::Error>
+    where
+        A: AmountOps,
+        A::Error: core::fmt::Display,
+    {
+        let btc = String::deserialize(d)?;
+        let amount = SignedAmount::from_str_in(&btc, Denomination::Bitcoin)
+            .map_err(DisplayFullError)
+            .map_err(serde::de::Error::custom)?;
+
+        A::try_from(amount).map_err(serde::de::Error::custom)
     }
 
     pub mod opt {
-        //! Serialize and deserialize `Option<Amount>` as a JSON string denominated in BTC.
+        //! Serialize and deserialize [`Option<Amount>`] and [`Option<SignedAmount>`] as a JSON
+        //! string denominated in BTC.
+        //!
         //! Use with `#[serde(default, with = "amount::serde::as_str::opt")]`.
 
         use core::fmt;
@@ -349,60 +554,136 @@ pub mod as_str {
 
         use serde::{de, Deserializer, Serializer};
 
-        use super::private;
-        use crate::amount::serde::SerdeAmountForOpt;
+        use crate::amount::serde::AmountOps;
+        use crate::amount::Denomination;
 
+        #[inline]
         #[allow(clippy::ref_option)] // API forced by serde.
-        pub fn serialize<A: SerdeAmountForOpt, S: Serializer>(
-            a: &Option<A>,
-            s: S,
-        ) -> Result<S::Ok, S::Error> {
-            match *a {
-                Some(a) => a.ser_str_opt(s, private::Token),
+        pub fn serialize<A, S: Serializer>(a: &Option<A>, s: S) -> Result<S::Ok, S::Error>
+        where
+            A: AmountOps,
+        {
+            match a.map(Into::into).map(|amt| amt.to_string_in(Denomination::Bitcoin)) {
+                Some(a) => s.serialize_some(&a),
                 None => s.serialize_none(),
             }
         }
 
-        pub fn deserialize<'d, A: SerdeAmountForOpt, D: Deserializer<'d>>(
-            d: D,
-        ) -> Result<Option<A>, D::Error> {
+        pub fn deserialize<'d, A, D: Deserializer<'d>>(d: D) -> Result<Option<A>, D::Error>
+        where
+            A: AmountOps,
+            A::Error: core::fmt::Display,
+        {
             struct VisitOptAmt<X>(PhantomData<X>);
 
-            impl<'de, X: SerdeAmountForOpt> de::Visitor<'de> for VisitOptAmt<X> {
+            impl<'de, X> de::Visitor<'de> for VisitOptAmt<X>
+            where
+                X: AmountOps,
+                X::Error: core::fmt::Display,
+            {
                 type Value = Option<X>;
 
                 fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
                     write!(formatter, "an Option<String>")
                 }
 
+                #[inline]
                 fn visit_none<E>(self) -> Result<Self::Value, E>
                 where
                     E: de::Error,
                 {
                     Ok(None)
                 }
+
+                #[inline]
                 fn visit_some<D>(self, d: D) -> Result<Self::Value, D::Error>
                 where
                     D: Deserializer<'de>,
                 {
-                    Ok(Some(X::des_str(d, private::Token)?))
+                    Ok(Some(super::deserialize(d)?))
                 }
             }
             d.deserialize_option(VisitOptAmt::<A>(PhantomData))
+        }
+    }
+
+    pub mod vec {
+        //! Serialize and deserialize [`Vec<Amount>`] and [`Vec<SignedAmount>`] as JSON strings
+        //! denominated in BTC.
+        //!
+        //! Use with `#[serde(with = "amount::serde::as_str::vec")]`.
+        //!
+        //! [`Vec<Amount>`]: crate::Amount
+        //! [`Vec<SignedAmount>`]: crate::SignedAmount
+
+        use alloc::vec::Vec;
+        use core::fmt;
+        use core::marker::PhantomData;
+
+        use serde::de::{self, SeqAccess};
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        use crate::amount::serde::AmountOps;
+        use crate::amount::{Denomination, SignedAmount};
+
+        #[inline]
+        pub fn serialize<A, S: Serializer>(a: &[A], s: S) -> Result<S::Ok, S::Error>
+        where
+            A: AmountOps,
+        {
+            s.collect_seq(a.iter().map(|amount| {
+                let signed_amount: SignedAmount = (*amount).into();
+                signed_amount.to_string_in(Denomination::Bitcoin)
+            }))
+        }
+
+        pub fn deserialize<'d, A, D: Deserializer<'d>>(d: D) -> Result<Vec<A>, D::Error>
+        where
+            A: AmountOps,
+            A::Error: core::fmt::Display,
+        {
+            struct VisitVec<X>(PhantomData<X>);
+
+            impl<'de, X> de::Visitor<'de> for VisitVec<X>
+            where
+                X: AmountOps,
+                X::Error: core::fmt::Display,
+            {
+                type Value = Vec<X>;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    write!(f, "a sequence of String")
+                }
+
+                fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                where
+                    A: SeqAccess<'de>,
+                {
+                    #[derive(Deserialize)]
+                    #[serde(transparent)]
+                    struct Wrapper(#[serde(with = "super")] SignedAmount);
+
+                    let mut out = Vec::with_capacity(internals::serde::cautious_size_hint::<X>(
+                        seq.size_hint(),
+                    ));
+                    while let Some(wrapped) = seq.next_element::<Wrapper>()? {
+                        out.push(X::try_from(wrapped.0).map_err(de::Error::custom)?);
+                    }
+                    Ok(out)
+                }
+            }
+
+            d.deserialize_seq(VisitVec::<A>(PhantomData))
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::amount;
 
-    #[test]
-    fn sanity_check() {
-        assert_eq!(Amount::type_prefix(private::Token), "u");
-        assert_eq!(SignedAmount::type_prefix(private::Token), "i");
-    }
+    use serde::{Deserialize, Serialize};
+
+    use crate::amount::{self, Amount, SignedAmount};
 
     #[test]
     fn can_serde_as_sat() {
@@ -410,16 +691,18 @@ mod tests {
         pub struct HasAmount {
             #[serde(with = "amount::serde::as_sat")]
             pub amount: Amount,
+            #[serde(with = "amount::serde::as_sat")]
+            pub signed_amount: SignedAmount,
         }
 
-        let orig = HasAmount { amount: Amount::ONE_BTC };
+        let orig = HasAmount { amount: Amount::ONE_BTC, signed_amount: SignedAmount::ONE_BTC };
 
         let json = serde_json::to_string(&orig).expect("failed to ser");
-        let want = "{\"amount\":100000000}";
+        let want = "{\"amount\":100000000,\"signed_amount\":100000000}";
         assert_eq!(json, want);
 
-        let rinsed: HasAmount = serde_json::from_str(&json).expect("failed to deser");
-        assert_eq!(rinsed, orig);
+        let roundtrip: HasAmount = serde_json::from_str(&json).expect("failed to deser");
+        assert_eq!(roundtrip, orig);
     }
 
     #[test]
@@ -429,16 +712,18 @@ mod tests {
         pub struct HasAmount {
             #[serde(with = "amount::serde::as_btc")]
             pub amount: Amount,
+            #[serde(with = "amount::serde::as_btc")]
+            pub signed_amount: SignedAmount,
         }
 
-        let orig = HasAmount { amount: Amount::ONE_BTC };
+        let orig = HasAmount { amount: Amount::ONE_BTC, signed_amount: SignedAmount::ONE_BTC };
 
         let json = serde_json::to_string(&orig).expect("failed to ser");
-        let want = "{\"amount\":1.0}";
+        let want = "{\"amount\":1.0,\"signed_amount\":1.0}";
         assert_eq!(json, want);
 
-        let rinsed: HasAmount = serde_json::from_str(&json).expect("failed to deser");
-        assert_eq!(rinsed, orig);
+        let roundtrip: HasAmount = serde_json::from_str(&json).expect("failed to deser");
+        assert_eq!(roundtrip, orig);
     }
 
     #[test]
@@ -448,15 +733,17 @@ mod tests {
         pub struct HasAmount {
             #[serde(with = "amount::serde::as_str")]
             pub amount: Amount,
+            #[serde(with = "amount::serde::as_str")]
+            pub signed_amount: SignedAmount,
         }
 
-        let orig = HasAmount { amount: Amount::ONE_BTC };
+        let orig = HasAmount { amount: Amount::ONE_BTC, signed_amount: SignedAmount::ONE_BTC };
 
         let json = serde_json::to_string(&orig).expect("failed to ser");
-        let want = "{\"amount\":\"1\"}";
+        let want = "{\"amount\":\"1\",\"signed_amount\":\"1\"}";
         assert_eq!(json, want);
 
-        let rinsed: HasAmount = serde_json::from_str(&json).expect("failed to deser");
-        assert_eq!(rinsed, orig);
+        let roundtrip: HasAmount = serde_json::from_str(&json).expect("failed to deser");
+        assert_eq!(roundtrip, orig);
     }
 }

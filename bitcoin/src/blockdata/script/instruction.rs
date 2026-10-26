@@ -2,8 +2,8 @@
 
 use internals::script::{self, PushDataLenLen};
 
-use super::{Error, PushBytes, Script, ScriptBuf, ScriptBufExtPriv as _};
-use crate::opcodes::{self, Opcode};
+use super::{Error, PushBytes, PushBytesExt as _, Script, ScriptBufExtPriv as _};
+use crate::opcodes::{self, Opcode, OpcodeExt as _};
 
 /// A "parsed opcode" which allows iterating over a [`Script`] in a more sensible way.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -48,7 +48,7 @@ impl Instruction<'_> {
                 }
             }
             Instruction::PushBytes(bytes) =>
-                super::read_scriptint_non_minimal(bytes.as_bytes()).ok(),
+                super::read_scriptint_non_minimal(bytes.as_bytes()).ok().map(i64::from),
         }
     }
 
@@ -56,7 +56,10 @@ impl Instruction<'_> {
     pub(super) fn script_serialized_len(&self) -> usize {
         match self {
             Instruction::Op(_) => 1,
-            Instruction::PushBytes(bytes) => ScriptBuf::reserved_len_for_slice(bytes.len()),
+            // The use of `ScriptSigBuf` here is arbitrary. Rust insists that we pick
+            // a specific tagged script type.
+            Instruction::PushBytes(bytes) =>
+                super::ScriptSigBuf::reserved_len_for_slice(bytes.len()),
         }
     }
 
@@ -74,7 +77,7 @@ impl Instruction<'_> {
                     _ => None,
                 }
             }
-            Instruction::PushBytes(bytes) => bytes.read_scriptint().ok(),
+            Instruction::PushBytes(bytes) => bytes.read_cltv_scriptint().ok(),
         }
     }
 }
@@ -90,7 +93,10 @@ impl<'a> Instructions<'a> {
     /// Views the remaining script as a slice.
     ///
     /// This is analogous to what [`core::str::Chars::as_str`] does.
-    pub fn as_script(&self) -> &'a Script { Script::from_bytes(self.data.as_slice()) }
+    pub fn as_script<T>(&self) -> &'a Script<T> { Script::from_bytes(self.data.as_slice()) }
+
+    /// The number of remaining bytes in the script.
+    fn remaining_bytes(&self) -> usize { self.data.as_slice().len() }
 
     /// Sets the iterator to end so that it won't iterate any longer.
     pub(super) fn kill(&mut self) {
@@ -122,7 +128,11 @@ impl<'a> Instructions<'a> {
         len: PushDataLenLen,
         min_push_len: usize,
     ) -> Option<Result<Instruction<'a>, Error>> {
-        let n = match script::read_push_data_len(&mut self.data, len) {
+        let Ok(n) = script::read_push_data_len(&mut self.data, len) else {
+            self.kill();
+            return Some(Err(Error::EarlyEndOfScript));
+        };
+        let n = match usize::try_from(n) {
             Ok(n) => n,
             Err(_) => {
                 self.kill();
@@ -184,7 +194,7 @@ impl<'a> Iterator for Instructions<'a> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        if self.data.len() == 0 {
+        if self.data.as_slice().is_empty() {
             (0, Some(0))
         } else {
             // There will not be more instructions than bytes
@@ -211,14 +221,14 @@ impl<'a> InstructionIndices<'a> {
     ///
     /// This is analogous to what [`core::str::Chars::as_str`] does.
     #[inline]
-    pub fn as_script(&self) -> &'a Script { self.instructions.as_script() }
+    pub fn as_script<T>(&self) -> &'a Script<T> { self.instructions.as_script() }
 
     /// Constructs a new `Self` setting `pos` to 0.
     pub(super) fn from_instructions(instructions: Instructions<'a>) -> Self {
         InstructionIndices { instructions, pos: 0 }
     }
 
-    pub(super) fn remaining_bytes(&self) -> usize { self.instructions.as_script().len() }
+    pub(super) fn remaining_bytes(&self) -> usize { self.instructions.remaining_bytes() }
 
     /// Modifies the iterator using `next_fn` returning the next item.
     ///
@@ -247,11 +257,6 @@ impl<'a> Iterator for InstructionIndices<'a> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) { self.instructions.size_hint() }
-
-    // the override avoids computing pos multiple times
-    fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.next_with(|this| this.instructions.nth(n))
-    }
 }
 
 impl core::iter::FusedIterator for InstructionIndices<'_> {}

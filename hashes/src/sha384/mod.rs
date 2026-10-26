@@ -5,17 +5,18 @@
 use crate::sha512;
 
 crate::internal_macros::general_hash_type! {
-    384,
-    false,
-    "Output of the SHA384 hash function."
+    /// Output of the SHA384 hash function.
+    pub struct Hash([u8; 48]);
+
+    const DISPLAY_BACKWARD: bool = false;
 }
 
 impl Hash {
-    /// Finalize a hash engine to produce a hash.
+    /// Finalizes a hash engine to produce a hash.
     pub fn from_engine(e: HashEngine) -> Self {
         let mut ret = [0; 48];
         ret.copy_from_slice(&sha512::Hash::from_engine(e.0).as_byte_array()[..48]);
-        Hash(ret)
+        Self(ret)
     }
 }
 
@@ -34,7 +35,6 @@ impl Default for HashEngine {
 
 impl crate::HashEngine for HashEngine {
     type Hash = Hash;
-    type Bytes = [u8; 48];
     const BLOCK_SIZE: usize = sha512::BLOCK_SIZE;
 
     fn n_bytes_hashed(&self) -> u64 { self.0.n_bytes_hashed() }
@@ -61,7 +61,7 @@ mod tests {
 
         #[rustfmt::skip]
         let tests = [
-            // Examples from go sha384 tests.
+            // Examples from go SHA384 tests.
             Test {
                 input: "",
                 output: [
@@ -140,42 +140,5 @@ mod tests {
             assert_eq!(hash, manual_hash);
             assert_eq!(hash.to_byte_array(), test.output);
         }
-    }
-}
-
-#[cfg(bench)]
-mod benches {
-    use test::Bencher;
-
-    use crate::{sha384, Hash, HashEngine};
-
-    #[bench]
-    pub fn sha384_10(bh: &mut Bencher) {
-        let mut engine = sha384::Hash::engine();
-        let bytes = [1u8; 10];
-        bh.iter(|| {
-            engine.input(&bytes);
-        });
-        bh.bytes = bytes.len() as u64;
-    }
-
-    #[bench]
-    pub fn sha384_1k(bh: &mut Bencher) {
-        let mut engine = sha384::Hash::engine();
-        let bytes = [1u8; 1024];
-        bh.iter(|| {
-            engine.input(&bytes);
-        });
-        bh.bytes = bytes.len() as u64;
-    }
-
-    #[bench]
-    pub fn sha384_64k(bh: &mut Bencher) {
-        let mut engine = sha384::Hash::engine();
-        let bytes = [1u8; 65536];
-        bh.iter(|| {
-            engine.input(&bytes);
-        });
-        bh.bytes = bytes.len() as u64;
     }
 }

@@ -1,10 +1,17 @@
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, process};
 
-use bitcoin::consensus::{encode, Decodable};
-use bitcoin_p2p_messages::{self, address, message, message_network, Magic, ServiceFlags};
+use bitcoin_p2p_messages::message_network::{ClientSoftwareVersion, UserAgent, UserAgentVersion};
+use bitcoin_p2p_messages::{
+    self, address, message, message_network, Magic, ProtocolVersion, ServiceFlags,
+};
+
+const SOFTWARE_VERSION: ClientSoftwareVersion =
+    ClientSoftwareVersion::SemVer { major: 0, minor: 1, revision: 0 };
+const USER_AGENT_VERSION: UserAgentVersion = UserAgentVersion::new(SOFTWARE_VERSION);
+const SOFTWARE_NAME: &str = "rust-client";
 
 fn main() {
     // This example establishes a connection to a Bitcoin node, sends the initial
@@ -24,29 +31,31 @@ fn main() {
 
     let version_message = build_version_message(address);
 
-    let first_message = message::RawNetworkMessage::new(Magic::BITCOIN, version_message);
+    let first_message = message::V1NetworkMessage::new(Magic::BITCOIN, version_message);
 
     if let Ok(mut stream) = TcpStream::connect(address) {
         // Send the message
-        let _ = stream.write_all(encode::serialize(&first_message).as_slice());
+        encoding::encode_to_writer(&first_message, &mut stream).unwrap();
         println!("Sent version message");
 
         // Setup StreamReader
         let read_stream = stream.try_clone().unwrap();
         let mut stream_reader = BufReader::new(read_stream);
         loop {
-            // Loop an retrieve new messages
-            let reply = message::RawNetworkMessage::consensus_decode(&mut stream_reader).unwrap();
+            // Loop and retrieve new messages
+            let reply =
+                encoding::decode_from_read::<message::V1NetworkMessage, _>(&mut stream_reader)
+                    .unwrap();
             match reply.payload() {
                 message::NetworkMessage::Version(_) => {
                     println!("Received version message: {:?}", reply.payload());
 
-                    let second_message = message::RawNetworkMessage::new(
+                    let second_message = message::V1NetworkMessage::new(
                         Magic::BITCOIN,
                         message::NetworkMessage::Verack,
                     );
 
-                    let _ = stream.write_all(encode::serialize(&second_message).as_slice());
+                    encoding::encode_to_writer(&second_message, &mut stream).unwrap();
                     println!("Sent verack message");
                 }
                 message::NetworkMessage::Verack => {
@@ -69,6 +78,9 @@ fn build_version_message(address: SocketAddr) -> message::NetworkMessage {
     // Building version message, see https://en.bitcoin.it/wiki/Protocol_documentation#version
     let my_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
 
+    // The version of the p2p protocol this client will use
+    let protocol_version = ProtocolVersion::BIP0031_VERSION;
+
     // "bitfield of features to be enabled for this connection"
     let services = ServiceFlags::NONE;
 
@@ -85,14 +97,15 @@ fn build_version_message(address: SocketAddr) -> message::NetworkMessage {
     // Because this crate does not include the `rand` dependency, this is a fixed value.
     let nonce: u64 = 42;
 
-    // "User Agent (0x00 if string is 0 bytes long)"
-    let user_agent = String::from("rust-example");
-
     // "The last block received by the emitting node"
     let start_height: i32 = 0;
 
+    // A formatted string describing the software in use.
+    let user_agent = UserAgent::new(SOFTWARE_NAME, &USER_AGENT_VERSION);
+
     // Construct the message
     message::NetworkMessage::Version(message_network::VersionMessage::new(
+        protocol_version,
         services,
         timestamp as i64,
         addr_recv,

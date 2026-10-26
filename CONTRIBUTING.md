@@ -13,10 +13,16 @@ changes to this document in a pull request.
 - [General](#general)
 - [Communication channels](#communication-channels)
 - [Asking questions](#asking-questions)
+- [Getting Started](#getting-started)
+  * [Installing Rust](#installing-rust)
+  * [Building](#building)
+- [Development Tools](#development-tools)
+  * [Just](#just)
+  * [Building the docs](#building-the-docs)
 - [Contribution workflow](#contribution-workflow)
   * [Preparing PRs](#preparing-prs)
   * [Peer review](#peer-review)
-  * [CI and Merging](#merging)
+  * [CI and Merging](#ci-and-merging)
   * [Repository maintainers](#repository-maintainers)
 - [Coding conventions](#coding-conventions)
   * [Naming conventions](#naming-conventions)
@@ -25,6 +31,10 @@ changes to this document in a pull request.
   * [Policy](#policy)
 - [Security](#security)
 - [Testing](#testing)
+  * [Unit/Integration tests](#unitintegration-tests)
+  * [Benchmarks](#benchmarks)
+  * [Mutation tests](#mutation-tests)
+  * [Code verification](#code-verification)
 - [Going further](#going-further)
 
 
@@ -42,6 +52,7 @@ money. That being said, we deeply welcome people contributing for the first time
 to an open source project or pick up Rust while contributing. Don't be shy,
 you'll learn.
 
+For a more in depth discussion of our coding policy see [policy.md](./docs/policy.md)
 
 ## Communication channels
 
@@ -67,13 +78,60 @@ We have a dedicated developer channel on IRC, #bitcoin-rust@libera.chat where
 you may get helpful advice if you have questions.
 
 
+## Getting Started
+
+### Installing Rust
+
+Rust can be installed using your package manager of choice or [rustup.rs](https://rustup.rs). The
+former way is considered more secure since it typically doesn't involve trust in the CA system. But
+you should be aware that the version of Rust shipped by your distribution might be out of date.
+Generally this isn't a problem for `rust-bitcoin` since we support much older versions than the
+current stable one (see MSRV section in [README.md](./README.md)).
+
+### Building
+
+The library can be built and tested using [`cargo`](https://github.com/rust-lang/cargo/):
+
+```
+git clone git@github.com:rust-bitcoin/rust-bitcoin.git
+cd rust-bitcoin
+cargo build
+```
+
+You can run tests with:
+
+```
+cargo test
+```
+
+Please refer to the [`cargo` documentation](https://doc.rust-lang.org/stable/cargo/) for more
+detailed instructions.
+
+
+## Development Tools
+
+### Just
+
+We support [`just`](https://just.systems/man/en/) for running dev workflow commands. Run `just` from
+your shell to see a list of available sub-commands.
+
+### Building the docs
+
+We build docs with the nightly toolchain, you may wish to use the following shell alias to check
+your documentation changes build correctly.
+
+```
+alias build-docs='RUSTDOCFLAGS="--cfg docsrs" cargo +nightly rustdoc --features="$FEATURES" -- -D rustdoc::broken-intra-doc-links'
+```
+
+
 ## Contribution workflow
 
 The codebase is maintained using the "contributor workflow" where everyone
 without exception contributes patch proposals using "pull requests". This
 facilitates social contribution, easy testing and peer review.
 
-To contribute a patch, the workflow is a as follows:
+To contribute a patch, the workflow is as follows:
 
 1. Fork Repository
 2. Create topic branch
@@ -107,7 +165,7 @@ Prerequisites that a PR must satisfy for merging into the `master` branch:
 * the tip of any PR branch must also compile and pass tests with no errors on
   MSRV (check [README.md] on current MSRV requirements) and pass fuzz tests on
   nightly rust;
-* contain all necessary tests for the introduced functional (either as a part of
+* contain all necessary tests for the introduced functionality (either as a part of
   commits, or, more preferably, as separate commits, so that it's easy to
   reorder them during review and check that the new tests fail without the new
   code);
@@ -217,6 +275,10 @@ Use of `unsafe` code is prohibited unless there is a unanimous decision among
 library maintainers on the exclusion from this rule. In such cases there is a
 requirement to test unsafe code with sanitizers including Miri.
 
+### Policy
+
+For broader project policy and guidelines, see [policy.md](./docs/policy.md).
+
 ### API changes
 
 All PRs that change the public API of `rust-bitcoin` will be checked on CI for
@@ -224,274 +286,6 @@ semversioning compliance. This means that if the PR changes the public API in a
 way that is not backwards compatible, the PR will be flagged as a breaking change.
 Please check the [`semver-checks` workflow](.github/workflows/semver-checks.yml).
 Under the hood we use [`cargo-semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks).
-
-
-### Policy
-
-We have various `rust-bitcoin` specific coding styles and conventions that are
-grouped here loosely under the term 'policy'. These are things we try to adhere
-to but that you should not need to worry too much about if you are a new
-contributor. Think of this as a place to collect group knowledge that exists in
-the various PRs over the last few years.
-
-#### Import statements
-
-We use the following style for import statements, see
-(https://github.com/rust-bitcoin/rust-bitcoin/discussions/2088) for the discussion that led to this.
-
-```rust
-// Modules first, as they are part of the project's structure.
-pub mod aa_this;
-mod bb_private;
-pub mod cc_that;
-
-// Private imports, rustfmt will sort and merge them correctly.
-use crate::aa_this::{This, That};
-use crate::bb_that;
-
-// Public re-exports.
-#[rustfmt::skip] // Keeps public re-exports separate, because of this we have to sort manually.
-pub use {
-    crate::aa_aa_this,
-    crate::bb_bb::That,
-}
-
-// Avoid wildcard imports, except for 3 rules:
-
-// Rule 1 - test modules.
-#[cfg(test)]
-mod tests {
-    use super::*; // OK
-}
-
-// Rule 2 - enum variants.
-use LockTime::*; // OK
-
-// Rule 3 - opcodes.
-use opcodes::all::*; // OK
-
-// Finally here is an example where we don't allow wildcard imports:
-use crate::prelude::*; // *NOT* OK
-use crate::prelude::{DisplayHex, String, Vec} // OK
-```
-
-#### Return `Self`
-
-Use `Self` as the return type instead of naming the type. When constructing the return value use
-`Self` or the type name, whichever you prefer.
-
-```rust
-/// A counter that is always smaller than 100.
-pub struct Counter(u32);
-
-impl Counter {
-    /// Constructs a new `Counter`.
-    pub fn new() -> Self { Self(0) }
-
-    /// Returns a counter if it is possible to create one from x.
-    pub fn maybe(x: u32) -> Option<Self> {
-        match x {
-            x if x >= 100 => None,
-            c => Some(Counter(c)),
-        }
-    }
-}
-
-impl TryFrom<u32> for Counter {
-    type Error = TooBigError;
-
-    fn try_from(x: u32) -> Result<Self, Self::Error> {
-        if x >= 100 {
-            return Err(TooBigError);
-        }
-        Ok(Counter(x))
-    }
-}
-```
-
-When constructing the return value for error enums use `Self`.
-
-```rust
-impl From<foo::Error> for LongDescriptiveError {
-    fn from(e: foo::Error) -> Self { Self::Foo(e) }
-}
-```
-
-
-#### Errors
-
-Return as much context as possible with errors e.g., if an error was encountered parsing a string
-include the string in the returned error type. If a function consumes costly-to-compute input
-(allocations are also considered costly) it should return the input back in the error type.
-
-More specifically an error should
-
-- be `non_exhaustive` unless we _really_ never want to change it.
-- have private fields unless we are very confident they won't change.
-- derive `Debug, Clone, PartialEq, Eq` (and `Copy` iff not `non_exhaustive`).
-- implement Display using `write_err!()` macro if a variant contains an inner error source.
-- have `Error` suffix on error types (structs and enums).
-- not have `Error` suffix on enum variants.
-- call `internals::impl_from_infallible!`.
-- implement `std::error::Error` if they are public (feature gated on "std").
-- have messages in lower case, except for proper nouns and variable names.
-
-```rust
-/// Documentation for the `Error` type.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]  // Add liberally; if the error type may ever have new variants added.
-pub enum Error {
-    /// Documentation for variant A.
-    A,
-    /// Documentation for variant B.
-    B,
-}
-
-internals::impl_from_infallible!(Error);
-
-```
-
-All errors that live in an `error` module (eg, `foo/error.rs`) and appear in a public function in
-`foo` module should be available from `foo` i.e., should be re-exported from `foo/mod.rs`.
-
-##### `expect` messages
-
-With respect to `expect` messages, they should follow the
-[Rust standard library guidelines](https://doc.rust-lang.org/std/option/enum.Option.html#recommended-message-style).
-More specifically, `expect` messages should be used to describe the reason
-you expect the operation to succeed.
-For example, this `expect` message clearly states why the operation should succeed:
-
-```rust
-/// Serializes the public key to bytes.
-pub fn to_bytes(self) -> Vec<u8> {
-    let mut buf = Vec::new();
-    self.write_into(&mut buf).expect("vecs don't error");
-    buf
-}
-```
-
-Also note that `expect` messages, as with all error messages, should be lower
-case, except for proper nouns and variable names.
-
-<details>
-<summary>The details on why we chose this style</summary>
-
-According to the [Rust standard library](https://doc.rust-lang.org/std/error/index.html#common-message-styles),
-there are two common styles for how to write `expect` messages:
-
-- using the message to present information to users encountering a panic
-  ("expect as error message"); and
-- using the message to present information to developers debugging the panic
-  ("expect as precondition").
-
-We opted to use the "expect as precondition" since it clearly states why the
-operation should succeed.
-This may be better for communicating with developers, since they are the target
-audience for the error message and `rust-bitcoin`.
-
-If you want to know more about the decision error messages and expect messages,
-please check:
-
-- https://github.com/rust-bitcoin/rust-bitcoin/issues/2913
-- https://github.com/rust-bitcoin/rust-bitcoin/issues/3053
-- https://github.com/rust-bitcoin/rust-bitcoin/pull/3019
-</details>
-
-#### Rustdocs
-
-Be liberal with references to BIPs or other documentation; the aim is that devs can learn about
-Bitcoin by hacking on this codebase as opposed to having to learn about Bitcoin first and then start
-hacking on this codebase. Consider the following format, not all sections will be required for all types.
-
-
-```rust
-/// The Bitcoin foobar.
-///
-/// Contains all the data used when passing a foobar around the Bitcoin network.
-///
-/// <details>
-/// <summary>FooBar Original Design</summary>
-///
-/// The foobar was introduced in Bitcoin x.y.z to increase the amount of foo in bar.
-///
-/// </details>
-///
-/// ### Relevant BIPs
-///
-/// * [BIP X - FooBar in Bitcoin](https://github.com/bitcoin/bips/blob/master/bip-0001.mediawiki)
-pub struct FooBar {
-    /// The version in use.
-    pub version: Version
-}
-```
-
-Do use rustdoc subheadings. Do put an empty newline below each heading e.g.,
-
-```rust
-impl FooBar {
-    /// Constructs a `FooBar` from a [`Baz`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `Baz` is not ...
-    ///
-    /// # Panics
-    ///
-    /// If the `Baz`, converted to a `usize`, is out of bounds.
-    pub fn from_baz(baz: Baz) -> Result<Self, Error> {
-        ...
-    }
-}
-```
-
-Add Panics section if any input to the function can trigger a panic.
-
-Generally we prefer to have non-panicking APIs but it is impractical in some cases. If you're not
-sure, feel free to ask. If we determine panicking is more practical it must be documented. Internal
-panics that could theoretically occur because of bugs in our code must not be documented.
-
-Example code within the rustdocs should compile and lint with `just lint` without any errors or
-warnings.
-
-#### Derives
-
-We try to use standard set of derives if it makes sense:
-
-```
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum Foo {
-    Bar,
-    Baz,
-}
-```
-
-For types that do should not form a total or partial order, or that technically do but it does not
-make sense to compare them, we use the `Ordered` trait from the
-[`ordered`](https://crates.io/crates/ordered) crate. See `absolute::LockTime` for an example.
-
-For error types you likely want to use `#[derive(Debug, Clone, PartialEq, Eq)]`.
-
-See [Errors](#errors) section.
-
-
-#### Attributes
-
-- `#[track_caller]`: Used on functions that panic on invalid arguments
-  (see https://rustc-dev-guide.rust-lang.org/backend/implicit-caller-location.html)
-
-- `#[cfg(rust_v_1_60)]`: Used to guard code that should only be built in if the toolchain is
-  compatible. These configuration conditionals are set at build time in `bitcoin/build.rs`. New
-  version attributes may be added as needed.
-
-
-#### Licensing
-
-We use SPDX license tags, all files should start with
-
-```
-// SPDX-License-Identifier: CC0-1.0
-```
 
 ## Security
 
@@ -506,14 +300,58 @@ apoelstra@wpsoftware.net, encrypted with his public key from
 
 ## Testing
 
-Related to the security aspect, rust bitcoin developers take testing very
+Related to the security aspect, rust-bitcoin developers take testing very
 seriously. Due to the modular nature of the project, writing new test cases is
 easy and good test coverage of the codebase is an important goal. Refactoring
 the project to enable fine-grained unit testing is also an ongoing effort.
 
-Various methods of testing are in use (e.g. fuzzing, mutation), please see
-the [readme](./README.md) for more information.
+Unit and integration tests are available for those interested, along with benchmarks. For project
+developers, especially new contributors looking for something to work on, we do:
 
+- Fuzz testing with [`libfuzzer`](https://github.com/rust-fuzz/libfuzzer)
+- Mutation testing with [`cargo-mutants`](https://github.com/sourcefrog/cargo-mutants)
+- Code verification with [`Kani`](https://github.com/model-checking/kani)
+
+There are always more tests to write and more bugs to find. PRs are extremely welcomed.
+Please consider testing code as a first-class citizen. We definitely do take PRs
+improving and cleaning up test code.
+
+### Unit/Integration tests
+
+Run as for any other Rust project `cargo test --all-features`.
+
+### Benchmarks
+
+Benchmarks use [criterion](https://github.com/criterion-rs/criterion.rs) and live in the separate
+`benches/` package (its own workspace, excluded from the root workspace). See
+[`benches/README.md`](./benches/README.md) for details.
+
+### Mutation tests
+
+We are doing mutation testing with [cargo-mutants](https://github.com/sourcefrog/cargo-mutants). To run
+these tests first install with `cargo install --locked cargo-mutants` then run with `cargo mutants --in-place --no-shuffle`.
+Note that running these mutation tests will take on the order of 10's of minutes.
+
+### Code verification
+
+We have started using [kani](https://github.com/model-checking/kani), install with `cargo install --locked kani-verifier`
+ (no need to run `cargo kani setup`). Run the tests with `cargo kani`.
+
+
+## LLMs, GitHub bot accounts, and AI agents
+
+This project does not accept contributions from bot GitHub accounts. All
+PRs that appear to come from such an account will be closed.
+
+Patches created by LLMs and AI agents are also viewed with suspicion unless a
+human has reviewed them. All LLM generated patches MUST have text in the git log
+and in the PR description that indicates the patch was created using an LLM.
+First time contributions by way of LLM generated patches are not welcome. Thanks
+for your time, please be respectful of ours.
+
+Commit messages, PR descriptions and Github comments must be substantially written
+by a human being. PRs entirely created by automonous agents are not permitted and
+will result in an organization-wide ban of the account opening them.
 
 ## Going further
 

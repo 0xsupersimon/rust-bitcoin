@@ -7,14 +7,14 @@
 //! single transaction.
 
 use crate::block::{self, Block, Checked};
-use crate::internal_macros::{impl_array_newtype, impl_array_newtype_stringify};
 use crate::locktime::absolute;
 use crate::network::{Network, Params};
 use crate::opcodes::all::*;
 use crate::pow::CompactTarget;
+use crate::script::{self, BuilderExt as _, BuilderExtPriv as _};
 use crate::transaction::{self, OutPoint, Transaction, TxIn, TxOut};
 use crate::witness::Witness;
-use crate::{script, Amount, BlockHash, BlockTime, Sequence, TestnetVersion};
+use crate::{Amount, BlockHash, BlockTime, Sequence, TestnetVersion};
 
 /// How many seconds between blocks we expect on average.
 pub const TARGET_BLOCK_SPACING: u32 = 600;
@@ -28,13 +28,13 @@ pub const WITNESS_SCALE_FACTOR: usize = units::weight::WITNESS_SCALE_FACTOR;
 /// The maximum allowed number of signature check operations in a block.
 pub const MAX_BLOCK_SIGOPS_COST: i64 = 80_000;
 /// Mainnet (bitcoin) pubkey address prefix.
-pub const PUBKEY_ADDRESS_PREFIX_MAIN: u8 = 0; // 0x00
+pub const PUBKEY_ADDRESS_PREFIX_MAIN: u8 = addresses::PUBKEY_ADDRESS_PREFIX_MAIN; // 0x00
 /// Mainnet (bitcoin) script address prefix.
-pub const SCRIPT_ADDRESS_PREFIX_MAIN: u8 = 5; // 0x05
+pub const SCRIPT_ADDRESS_PREFIX_MAIN: u8 = addresses::SCRIPT_ADDRESS_PREFIX_MAIN; // 0x05
 /// Test (testnet, signet, regtest) pubkey address prefix.
-pub const PUBKEY_ADDRESS_PREFIX_TEST: u8 = 111; // 0x6f
+pub const PUBKEY_ADDRESS_PREFIX_TEST: u8 = addresses::PUBKEY_ADDRESS_PREFIX_TEST; // 0x6f
 /// Test (testnet, signet, regtest) script address prefix.
-pub const SCRIPT_ADDRESS_PREFIX_TEST: u8 = 196; // 0xc4
+pub const SCRIPT_ADDRESS_PREFIX_TEST: u8 = addresses::SCRIPT_ADDRESS_PREFIX_TEST; // 0xc4
 /// The maximum allowed redeem script size for a P2SH output.
 pub const MAX_REDEEM_SCRIPT_SIZE: usize = primitives::script::MAX_REDEEM_SCRIPT_SIZE; // 520
 /// The maximum allowed redeem script size of the witness script.
@@ -79,8 +79,8 @@ fn bitcoin_genesis_tx(params: &Params) -> Transaction {
     let mut ret = Transaction {
         version: transaction::Version::ONE,
         lock_time: absolute::LockTime::ZERO,
-        input: vec![],
-        output: vec![],
+        inputs: vec![],
+        outputs: vec![],
     };
 
     let (in_script, out_script) = {
@@ -105,14 +105,14 @@ fn bitcoin_genesis_tx(params: &Params) -> Transaction {
         }
     };
 
-    ret.input.push(TxIn {
+    ret.inputs.push(TxIn {
         previous_output: OutPoint::COINBASE_PREVOUT,
         script_sig: in_script,
         sequence: Sequence::MAX,
         witness: Witness::default(),
     });
 
-    ret.output.push(TxOut { value: Amount::FIFTY_BTC, script_pubkey: out_script });
+    ret.outputs.push(TxOut { amount: Amount::FIFTY_BTC, script_pubkey: out_script });
 
     // end
     ret
@@ -162,6 +162,18 @@ pub fn genesis_block(params: impl AsRef<Params>) -> Block<Checked> {
             transactions,
         )
         .assume_checked(witness_root),
+        Network::Testnet(_) => Block::new_unchecked(
+            block::Header {
+                version: block::Version::ONE,
+                prev_blockhash: BlockHash::GENESIS_PREVIOUS_BLOCK_HASH,
+                merkle_root,
+                time: BlockTime::from_u32(1296688602),
+                bits: CompactTarget::from_consensus(0x1d00ffff),
+                nonce: 414098458,
+            },
+            transactions,
+        )
+        .assume_checked(witness_root),
         Network::Signet => Block::new_unchecked(
             block::Header {
                 version: block::Version::ONE,
@@ -197,33 +209,33 @@ impl_array_newtype_stringify!(ChainHash, 32);
 
 impl ChainHash {
     // Mainnet value can be verified at https://github.com/lightning/bolts/blob/master/00-introduction.md
-    /// `ChainHash` for mainnet bitcoin.
+    /// `ChainHash` for Bitcoin Mainnet.
     pub const BITCOIN: Self = Self([
         111, 226, 140, 10, 182, 241, 179, 114, 193, 166, 162, 70, 174, 99, 247, 79, 147, 30, 131,
         101, 225, 90, 8, 156, 104, 214, 25, 0, 0, 0, 0, 0,
     ]);
-    /// `ChainHash` for testnet3 bitcoin.
-    #[deprecated(since = "0.33.0", note = "use `TESTNET3` instead")]
+    /// `ChainHash` for Bitcoin testnet3.
+    #[deprecated(since = "TBD", note = "use `TESTNET3` instead")]
     pub const TESTNET: Self = Self([
         67, 73, 127, 215, 248, 38, 149, 113, 8, 244, 163, 15, 217, 206, 195, 174, 186, 121, 151,
         32, 132, 233, 14, 173, 1, 234, 51, 9, 0, 0, 0, 0,
     ]);
-    /// `ChainHash` for testnet3 bitcoin.
+    /// `ChainHash` for Bitcoin testnet3.
     pub const TESTNET3: Self = Self([
         67, 73, 127, 215, 248, 38, 149, 113, 8, 244, 163, 15, 217, 206, 195, 174, 186, 121, 151,
         32, 132, 233, 14, 173, 1, 234, 51, 9, 0, 0, 0, 0,
     ]);
-    /// `ChainHash` for testnet4 bitcoin.
+    /// `ChainHash` for Bitcoin testnet4.
     pub const TESTNET4: Self = Self([
         67, 240, 139, 218, 176, 80, 227, 91, 86, 124, 134, 75, 145, 244, 127, 80, 174, 114, 90,
         226, 222, 83, 188, 251, 186, 242, 132, 218, 0, 0, 0, 0,
     ]);
-    /// `ChainHash` for signet bitcoin.
+    /// `ChainHash` for Bitcoin signet.
     pub const SIGNET: Self = Self([
         246, 30, 238, 59, 99, 163, 128, 164, 119, 160, 99, 175, 50, 178, 187, 201, 124, 159, 249,
         240, 31, 44, 66, 37, 233, 115, 152, 129, 8, 0, 0, 0,
     ]);
-    /// `ChainHash` for regtest bitcoin.
+    /// `ChainHash` for Bitcoin regtest.
     pub const REGTEST: Self = Self([
         6, 34, 110, 70, 17, 26, 11, 89, 202, 175, 18, 96, 67, 235, 91, 191, 40, 195, 79, 58, 94,
         51, 42, 31, 199, 178, 183, 60, 241, 136, 145, 15,
@@ -238,6 +250,7 @@ impl ChainHash {
             Network::Bitcoin => Self::BITCOIN,
             Network::Testnet(TestnetVersion::V3) => Self::TESTNET3,
             Network::Testnet(TestnetVersion::V4) => Self::TESTNET4,
+            Network::Testnet(_) => Self::TESTNET3,
             Network::Signet => Self::SIGNET,
             Network::Regtest => Self::REGTEST,
         }
@@ -252,6 +265,7 @@ impl ChainHash {
             Network::Bitcoin => Self::BITCOIN,
             Network::Testnet(TestnetVersion::V3) => Self::TESTNET3,
             Network::Testnet(TestnetVersion::V4) => Self::TESTNET4,
+            Network::Testnet(_) => Self::TESTNET3,
             Network::Signet => Self::SIGNET,
             Network::Regtest => Self::REGTEST,
         }
@@ -259,16 +273,23 @@ impl ChainHash {
 
     /// Converts genesis block hash into `ChainHash`.
     pub fn from_genesis_block_hash(block_hash: crate::BlockHash) -> Self {
-        ChainHash(block_hash.to_byte_array())
+        Self(block_hash.to_byte_array())
     }
+
+    /// Copies the underlying bytes into a new `Vec`.
+    #[inline]
+    #[deprecated(since = "TBD", note = "use to_vec instead")]
+    pub fn to_bytes(self) -> alloc::vec::Vec<u8> { self.to_vec() }
 }
 
 #[cfg(test)]
 mod test {
-    use hex_lit::hex;
+    use alloc::string::ToString;
+
+    use hex::hex;
 
     use super::*;
-    use crate::consensus::encode::serialize;
+    use crate::encoding::encode_to_vec;
     use crate::network::params;
     use crate::Txid;
 
@@ -277,17 +298,17 @@ mod test {
         let gen = bitcoin_genesis_tx(&Params::MAINNET);
 
         assert_eq!(gen.version, transaction::Version::ONE);
-        assert_eq!(gen.input.len(), 1);
-        assert_eq!(gen.input[0].previous_output.txid, Txid::COINBASE_PREVOUT);
-        assert_eq!(gen.input[0].previous_output.vout, 0xFFFFFFFF);
-        assert_eq!(serialize(&gen.input[0].script_sig),
+        assert_eq!(gen.inputs.len(), 1);
+        assert_eq!(gen.inputs[0].previous_output.txid, Txid::COINBASE_PREVOUT);
+        assert_eq!(gen.inputs[0].previous_output.vout, 0xFFFFFFFF);
+        assert_eq!(encode_to_vec(gen.inputs[0].script_sig.as_script()),
                    hex!("4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73"));
 
-        assert_eq!(gen.input[0].sequence, Sequence::MAX);
-        assert_eq!(gen.output.len(), 1);
-        assert_eq!(serialize(&gen.output[0].script_pubkey),
+        assert_eq!(gen.inputs[0].sequence, Sequence::MAX);
+        assert_eq!(gen.outputs.len(), 1);
+        assert_eq!(encode_to_vec(gen.outputs[0].script_pubkey.as_script()),
                    hex!("434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac"));
-        assert_eq!(gen.output[0].value, "50 BTC".parse::<Amount>().unwrap());
+        assert_eq!(gen.outputs[0].amount, "50 BTC".parse::<Amount>().unwrap());
         assert_eq!(gen.lock_time, absolute::LockTime::ZERO);
 
         assert_eq!(
@@ -369,9 +390,9 @@ mod test {
     fn chain_hash_and_genesis_block(network: Network) {
         use hashes::sha256;
 
-        // The genesis block hash is a double-sha256 and it is displayed backwards.
+        // The genesis block hash is a double-SHA256 and it is displayed backwards.
         let genesis_hash = genesis_block(network).block_hash();
-        // We abuse the sha256 hash here so we get a LowerHex impl that does not print the hex backwards.
+        // We abuse the SHA256 hash here so we get a LowerHex impl that does not print the hex backwards.
         let hash = sha256::Hash::from_byte_array(genesis_hash.to_byte_array());
         let want = format!("{:02x}", hash);
 
@@ -388,7 +409,7 @@ mod test {
             Network::Testnet(TestnetVersion::V4) => {},
             Network::Signet => {},
             Network::Regtest => {},
-            _ => panic!("update ChainHash::using_genesis_block and chain_hash_genesis_block with new variants"),
+            _ => panic!("update ChainHash::using_genesis_block and chain_hash_and_genesis_block with new variants"),
         }
     }
 

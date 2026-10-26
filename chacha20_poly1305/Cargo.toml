@@ -1,15 +1,16 @@
 [package]
 name = "chacha20-poly1305"
-version = "0.1.2"
-authors = ["Nick Johnson <nick@yonson.dev>", "Robert Netzke <rustaceanrob@protonmail.com>"]
+version = "0.2.1"
+authors = ["Nick Johnson <nick@yonson.dev>", "Robert Netzke <rob@2140.dev>"]
 license = "CC0-1.0"
 repository = "https://github.com/rust-bitcoin/rust-bitcoin/"
+homepage = "https://rust-bitcoin.org"
 description = "The ChaCha20 stream cipher and Poly1305 MAC based AEAD."
 categories = ["cryptography"]
 keywords = ["crypto", "encryption"]
 readme = "README.md"
 edition = "2021"
-rust-version = "1.63.0"
+rust-version = "1.74.0"
 exclude = ["tests", "contrib"]
 
 [features]
@@ -18,11 +19,11 @@ std = ["alloc"]
 alloc = []
 
 [dev-dependencies]
-hex = { package = "hex-conservative", version = "0.3.0", default-features = false, features = ["alloc"] }
+hex = { package = "hex-conservative", version = "1.1.0", default-features = false, features = ["alloc"] }
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-[lints.rust]
-unexpected_cfgs = { level = "deny", check-cfg = ['cfg(bench)'] }
+[lints]
+workspace = true
