@@ -150,15 +150,14 @@ impl BlockHeight {
     #[inline]
     pub const fn to_u32(self) -> u32 { self.0 }
 
-    /// Attempts to subtract two [`BlockHeight`]s, returning [`None`] if overflow occurred.
+    /// Attempt to subtract two [`BlockHeight`]s, returning [`None`] if overflow occurred.
     #[inline]
     #[must_use]
     pub fn checked_sub(self, other: Self) -> Option<BlockHeightInterval> {
         self.to_u32().checked_sub(other.to_u32()).map(BlockHeightInterval)
     }
 
-    /// Attempts to add an interval to this [`BlockHeight`], returning [`None`] if overflow
-    /// occurred.
+    /// Attempt to add an interval to this [`BlockHeight`], returning [`None`] if overflow occurred.
     #[inline]
     #[must_use]
     pub fn checked_add(self, other: BlockHeightInterval) -> Option<Self> {
@@ -274,14 +273,14 @@ impl BlockHeightInterval {
     #[inline]
     pub const fn to_u32(self) -> u32 { self.0 }
 
-    /// Attempts to subtract two [`BlockHeightInterval`]s, returning [`None`] if overflow occurred.
+    /// Attempt to subtract two [`BlockHeightInterval`]s, returning [`None`] if overflow occurred.
     #[inline]
     #[must_use]
     pub fn checked_sub(self, other: Self) -> Option<Self> {
         self.to_u32().checked_sub(other.to_u32()).map(Self)
     }
 
-    /// Attempts to add two [`BlockHeightInterval`]s, returning [`None`] if overflow occurred.
+    /// Attempt to add two [`BlockHeightInterval`]s, returning [`None`] if overflow occurred.
     #[inline]
     #[must_use]
     pub fn checked_add(self, other: Self) -> Option<Self> {
@@ -358,14 +357,14 @@ impl BlockMtp {
         Self::from_u32(u32::from(timestamps[5]))
     }
 
-    /// Attempts to subtract two [`BlockMtp`]s, returning [`None`] if overflow occurred.
+    /// Attempt to subtract two [`BlockMtp`]s, returning [`None`] if overflow occurred.
     #[inline]
     #[must_use]
     pub fn checked_sub(self, other: Self) -> Option<BlockMtpInterval> {
         self.to_u32().checked_sub(other.to_u32()).map(BlockMtpInterval)
     }
 
-    /// Attempts to add an interval to this [`BlockMtp`], returning [`None`] if overflow occurred.
+    /// Attempt to add an interval to this [`BlockMtp`], returning [`None`] if overflow occurred.
     #[inline]
     #[must_use]
     pub fn checked_add(self, other: BlockMtpInterval) -> Option<Self> {
@@ -456,14 +455,14 @@ impl BlockMtpInterval {
         relative::NumberOf512Seconds::from_seconds_ceil(self.to_u32())
     }
 
-    /// Attempts to subtract two [`BlockMtpInterval`]s, returning [`None`] if overflow occurred.
+    /// Attempt to subtract two [`BlockMtpInterval`]s, returning [`None`] if overflow occurred.
     #[inline]
     #[must_use]
     pub fn checked_sub(self, other: Self) -> Option<Self> {
         self.to_u32().checked_sub(other.to_u32()).map(Self)
     }
 
-    /// Attempts to add two [`BlockMtpInterval`]s, returning [`None`] if overflow occurred.
+    /// Attempt to add two [`BlockMtpInterval`]s, returning [`None`] if overflow occurred.
     #[inline]
     #[must_use]
     pub fn checked_add(self, other: Self) -> Option<Self> {
