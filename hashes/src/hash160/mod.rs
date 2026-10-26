@@ -10,20 +10,21 @@
 use crate::{ripemd160, sha256};
 
 crate::internal_macros::general_hash_type! {
-    160,
-    false,
-    "Output of the Bitcoin HASH160 hash function. (RIPEMD160(SHA256))"
+    /// Output of the Bitcoin HASH160 hash function. (RIPEMD160(SHA256))
+    pub struct Hash([u8; 20]);
+
+    const DISPLAY_BACKWARD: bool = false;
 }
 
 impl Hash {
-    /// Finalize a hash engine to produce a hash.
+    /// Finalizes a hash engine to produce a hash.
     pub fn from_engine(e: HashEngine) -> Self {
         let sha2 = sha256::Hash::from_engine(e.0);
         let rmd = ripemd160::Hash::hash(sha2.as_byte_array());
 
         let mut ret = [0; 20];
         ret.copy_from_slice(rmd.as_byte_array());
-        Hash(ret)
+        Self(ret)
     }
 }
 
@@ -42,7 +43,6 @@ impl Default for HashEngine {
 
 impl crate::HashEngine for HashEngine {
     type Hash = Hash;
-    type Bytes = [u8; 20];
     const BLOCK_SIZE: usize = 64; // Same as sha256::HashEngine::BLOCK_SIZE;
 
     fn input(&mut self, data: &[u8]) { self.0.input(data) }
@@ -128,42 +128,5 @@ mod tests {
         let hash = hash160::Hash::from_byte_array(HASH_BYTES);
         assert_tokens(&hash.compact(), &[Token::BorrowedBytes(&HASH_BYTES[..])]);
         assert_tokens(&hash.readable(), &[Token::Str("132072df690933835eb8b6ad0b77e7b6f14acad7")]);
-    }
-}
-
-#[cfg(bench)]
-mod benches {
-    use test::Bencher;
-
-    use crate::{hash160, Hash as _, HashEngine};
-
-    #[bench]
-    pub fn hash160_10(bh: &mut Bencher) {
-        let mut engine = hash160::Hash::engine();
-        let bytes = [1u8; 10];
-        bh.iter(|| {
-            engine.input(&bytes);
-        });
-        bh.bytes = bytes.len() as u64;
-    }
-
-    #[bench]
-    pub fn hash160_1k(bh: &mut Bencher) {
-        let mut engine = hash160::Hash::engine();
-        let bytes = [1u8; 1024];
-        bh.iter(|| {
-            engine.input(&bytes);
-        });
-        bh.bytes = bytes.len() as u64;
-    }
-
-    #[bench]
-    pub fn hash160_64k(bh: &mut Bencher) {
-        let mut engine = hash160::Hash::engine();
-        let bytes = [1u8; 65536];
-        bh.iter(|| {
-            engine.input(&bytes);
-        });
-        bh.bytes = bytes.len() as u64;
     }
 }

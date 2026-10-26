@@ -1,9 +1,18 @@
 //! Contains extensions related to slices.
 
+#[cfg(creusot)]
+use creusot_std::prelude::*;
+
 /// Extension trait for slice.
 pub trait SliceExt {
     /// The item type the slice is storing.
     type Item;
+
+    /// A hack to avoid having conditional View bound.
+    /// Named distinct from view to avoid annoying compiler messages.
+    #[cfg(creusot)]
+    #[logic]
+    fn view2(self) -> Seq<Self::Item>;
 
     /// Splits up the slice into a slice of arrays and a remainder.
     ///
@@ -14,6 +23,9 @@ pub trait SliceExt {
     /// let slice = [1, 2, 3];
     /// let _fail = slice.bitcoin_as_chunks::<0>(); // Fails to compile
     /// ```
+    #[cfg_attr(creusot, requires(N@ != 0))]
+    #[cfg_attr(creusot, ensures(forall<i> i >= 0 && i < self.view2().len() - self.view2().len() % N@ ==> result.0@[i]@ == self.view2().subsequence(i * N@, i * N@ + N@)))]
+    #[cfg_attr(creusot, ensures(result.1@ == self.view2().subsequence(self.view2().len() - self.view2().len() % N@, self.view2().len())))]
     fn bitcoin_as_chunks<const N: usize>(&self) -> (&[[Self::Item; N]], &[Self::Item]);
 
     /// Splits up the slice into a slice of arrays and a remainder.
@@ -25,6 +37,9 @@ pub trait SliceExt {
     /// let mut slice = [1, 2, 3];
     /// let _fail = slice.bitcoin_as_chunks_mut::<0>(); // Fails to compile
     /// ```
+    #[cfg_attr(creusot, requires(N@ != 0))]
+    #[cfg_attr(creusot, ensures(forall<i> i >= 0 && i < self.view2().len() - self.view2().len() % N@ ==> result.0@[i]@ == self.view2().subsequence(i * N@, i * N@ + N@)))]
+    #[cfg_attr(creusot, ensures(result.1@ == self.view2().subsequence(self.view2().len() - self.view2().len() % N@, self.view2().len())))]
     fn bitcoin_as_chunks_mut<const N: usize>(
         &mut self,
     ) -> (&mut [[Self::Item; N]], &mut [Self::Item]);
@@ -32,13 +47,21 @@ pub trait SliceExt {
     /// Tries to access a sub-array of length `ARRAY_LEN` at the specified `offset`.
     ///
     /// Returns `None` in case of out-of-bounds access.
+    #[cfg_attr(creusot, ensures(match result {
+        Some(arr) => arr@ == self.view2().subsequence(offset@, offset@ + ARRAY_LEN@),
+        None => offset@ + ARRAY_LEN@ > self.view2().len(),
+    }))]
     fn get_array<const ARRAY_LEN: usize>(&self, offset: usize) -> Option<&[Self::Item; ARRAY_LEN]>;
 
     /// Splits the slice into an array and remainder if it's long enough.
     ///
     /// Returns `None` if the slice is shorter than `ARRAY_LEN`
     #[allow(clippy::type_complexity)] // it's not really complex and redefining would make it
-                                      // harder to understand
+    // harder to understand
+    #[cfg_attr(creusot, ensures(match result {
+        Some((arr, remainder)) => arr@ == self.view2().subsequence(0, ARRAY_LEN@) && remainder@ == self.view2().subsequence(ARRAY_LEN@, self.view2().len()),
+        None => ARRAY_LEN@ > self.view2().len(),
+    }))]
     fn split_first_chunk<const ARRAY_LEN: usize>(
         &self,
     ) -> Option<(&[Self::Item; ARRAY_LEN], &[Self::Item])>;
@@ -47,7 +70,11 @@ pub trait SliceExt {
     ///
     /// Returns `None` if the slice is shorter than `ARRAY_LEN`
     #[allow(clippy::type_complexity)] // it's not really complex and redefining would make it
-                                      // harder to understand
+    // harder to understand
+    #[cfg_attr(creusot, ensures(match result {
+        Some((remainder, arr)) => arr@ == self.view2().subsequence(self.view2().len() - ARRAY_LEN@, self.view2().len()) && remainder@ == self.view2().subsequence(0, self.view2().len() - ARRAY_LEN@),
+        None => ARRAY_LEN@ > self.view2().len(),
+    }))]
     fn split_last_chunk<const ARRAY_LEN: usize>(
         &self,
     ) -> Option<(&[Self::Item], &[Self::Item; ARRAY_LEN])>;
@@ -56,9 +83,18 @@ pub trait SliceExt {
 impl<T> SliceExt for [T] {
     type Item = T;
 
+    #[cfg(creusot)]
+    #[logic(open, inline)]
+    fn view2(self) -> Seq<Self::Item> { <Self as View>::view(self) }
+
+    // Sadly, creusot doesn't support pointer casts yet, so we can't prove this
+    #[cfg_attr(creusot, trusted)]
+    #[cfg_attr(creusot, requires(N@ != 0))]
+    #[cfg_attr(creusot, ensures(forall<i> i >= 0 && i < self.view2().len() - self.view2().len() % N@ ==> result.0@[i]@ == self.view2().subsequence(i * N@, i * N@ + N@)))]
+    #[cfg_attr(creusot, ensures(result.1@ == self.view2().subsequence(self.view2().len() - self.view2().len() % N@, self.view2().len())))]
     fn bitcoin_as_chunks<const N: usize>(&self) -> (&[[Self::Item; N]], &[Self::Item]) {
         #[allow(clippy::let_unit_value)]
-        let _ = Hack::<N>::IS_NONZERO;
+        let () = Hack::<N>::IS_NONZERO;
 
         let chunks_count = self.len() / N;
         let total_left_len = chunks_count * N;
@@ -73,11 +109,16 @@ impl<T> SliceExt for [T] {
         (left, right)
     }
 
+    // Sadly, creusot doesn't support pointer casts yet, so we can't prove this
+    #[cfg_attr(creusot, trusted)]
+    #[cfg_attr(creusot, requires(N@ != 0))]
+    #[cfg_attr(creusot, ensures(forall<i> i >= 0 && i < self.view2().len() - self.view2().len() % N@ ==> result.0@[i]@ == self.view2().subsequence(i * N@, i * N@ + N@)))]
+    #[cfg_attr(creusot, ensures(result.1@ == self.view2().subsequence(self.view2().len() - self.view2().len() % N@, self.view2().len())))]
     fn bitcoin_as_chunks_mut<const N: usize>(
         &mut self,
     ) -> (&mut [[Self::Item; N]], &mut [Self::Item]) {
         #[allow(clippy::let_unit_value)]
-        let _ = Hack::<N>::IS_NONZERO;
+        let () = Hack::<N>::IS_NONZERO;
 
         let chunks_count = self.len() / N;
         let total_left_len = chunks_count * N;
@@ -95,14 +136,23 @@ impl<T> SliceExt for [T] {
         (left, right)
     }
 
+    #[cfg_attr(creusot, ensures(match result {
+        Some(arr) => arr@ == self.view2().subsequence(offset@, offset@ + ARRAY_LEN@),
+        None => offset@ + ARRAY_LEN@ > self.view2().len(),
+    }))]
     fn get_array<const ARRAY_LEN: usize>(&self, offset: usize) -> Option<&[Self::Item; ARRAY_LEN]> {
-        self.get(offset..(offset + ARRAY_LEN)).map(|slice| {
+        let end = offset.checked_add(ARRAY_LEN)?;
+        self.get(offset..end).map(|slice| {
             slice
                 .try_into()
                 .expect("the arguments to `get` evaluate to the same length the return type uses")
         })
     }
 
+    #[cfg_attr(creusot, ensures(match result {
+        Some((arr, remainder)) => arr@ == self.view2().subsequence(0, ARRAY_LEN@) && remainder@ == self.view2().subsequence(ARRAY_LEN@, self.view2().len()),
+        None => ARRAY_LEN@ > self.view2().len(),
+    }))]
     fn split_first_chunk<const ARRAY_LEN: usize>(
         &self,
     ) -> Option<(&[Self::Item; ARRAY_LEN], &[Self::Item])> {
@@ -113,6 +163,10 @@ impl<T> SliceExt for [T] {
         Some((first.try_into().expect("we're passing `ARRAY_LEN` to `split_at` above"), remainder))
     }
 
+    #[cfg_attr(creusot, ensures(match result {
+        Some((remainder, arr)) => arr@ == self.view2().subsequence(self.view2().len() - ARRAY_LEN@, self.view2().len()) && remainder@ == self.view2().subsequence(0, self.view2().len() - ARRAY_LEN@),
+        None => ARRAY_LEN@ > self.view2().len(),
+    }))]
     fn split_last_chunk<const ARRAY_LEN: usize>(
         &self,
     ) -> Option<(&[Self::Item], &[Self::Item; ARRAY_LEN])> {

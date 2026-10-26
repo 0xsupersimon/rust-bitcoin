@@ -2,7 +2,8 @@
 
 use internals::rust_version;
 
-internals::transparent_newtype! {
+// Defined in `REPO_DIR/include/newtype.rs`.
+crate::transparent_newtype! {
     /// A bridging wrapper providing the I/O traits for types that already implement `std` I/O traits.
     #[derive(Debug)]
     pub struct FromStd<T>(T);
@@ -35,12 +36,12 @@ impl<T> FromStd<T> {
 
     /// Returns a reference to the wrapped value.
     #[inline]
-    #[deprecated(since = "TBD", note = "use `get_ref()` instead")]
+    #[deprecated(since = "0.3.0", note = "use `get_ref()` instead")]
     pub fn inner(&self) -> &T { &self.0 }
 
     /// Returns a mutable reference to the wrapped value.
     #[inline]
-    #[deprecated(since = "TBD", note = "use `get_ref()` instead")]
+    #[deprecated(since = "0.3.0", note = "use `get_mut()` instead")]
     pub fn inner_mut(&mut self) -> &mut T { &mut self.0 }
 }
 
@@ -108,7 +109,8 @@ impl<T: std::io::Write> std::io::Write for FromStd<T> {
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> { self.0.write_all(buf) }
 }
 
-internals::transparent_newtype! {
+// Defined in `REPO_DIR/include/newtype.rs`.
+crate::transparent_newtype! {
     /// A bridging wrapper providing the std traits for types that already implement our traits.
     #[derive(Debug)]
     pub struct ToStd<T>(T);
@@ -253,40 +255,20 @@ macro_rules! impl_our {
     };
 }
 
-rust_version! {
-    if >= 1.72 {
-        impl_our! {
-            impl<R: std::io::Read> Read for std::io::BufReader<R> where R: ?Sized
-        }
+impl_our! {
+    impl<R: std::io::Read> Read for std::io::BufReader<R> where R: ?Sized
+}
 
-        impl_our! {
-            impl<R: std::io::Read> BufRead for std::io::BufReader<R> where R: ?Sized
-        }
+impl_our! {
+    impl<R: std::io::Read> BufRead for std::io::BufReader<R> where R: ?Sized
+}
 
-        impl_our! {
-            impl<W: std::io::Write> Write for std::io::BufWriter<W> where W: ?Sized
-        }
+impl_our! {
+    impl<W: std::io::Write> Write for std::io::BufWriter<W> where W: ?Sized
+}
 
-        impl_our! {
-            impl<W: std::io::Write> Write for std::io::LineWriter<W> where W: ?Sized
-        }
-    } else {
-        impl_our! {
-            impl<R: std::io::Read> Read for std::io::BufReader<R>
-        }
-
-        impl_our! {
-            impl<R: std::io::Read> BufRead for std::io::BufReader<R>
-        }
-
-        impl_our! {
-            impl<W: std::io::Write> Write for std::io::BufWriter<W>
-        }
-
-        impl_our! {
-            impl<W: std::io::Write> Write for std::io::LineWriter<W>
-        }
-    }
+impl_our! {
+    impl<W: std::io::Write> Write for std::io::LineWriter<W> where W: ?Sized
 }
 
 impl std::io::Write for super::Sink {
@@ -344,25 +326,21 @@ impl_our! {
     impl BufRead for std::io::Empty
 }
 
-rust_version! {
-    if >= 1.73 {
-        impl_our! {
-            impl Write for std::io::Empty
-        }
+impl_our! {
+    impl Write for std::io::Empty
+}
 
-        // No idea why &Empty impls Write but not Read + BufRead
-        impl_our! {
-            impl Write for &'_ std::io::Empty
-        }
+// No idea why &Empty impls Write but not Read + BufRead
+impl_our! {
+    impl Write for &'_ std::io::Empty
+}
 
-        impl_our! {
-            impl Read for std::sync::Arc<std::fs::File>
-        }
+impl_our! {
+    impl Read for std::sync::Arc<std::fs::File>
+}
 
-        impl_our! {
-            impl Write for std::sync::Arc<std::fs::File>
-        }
-    }
+impl_our! {
+    impl Write for std::sync::Arc<std::fs::File>
 }
 
 impl_our! {

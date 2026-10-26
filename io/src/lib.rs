@@ -13,41 +13,45 @@
 //! For examples of how to use and implement the types and traits in this crate see `io.rs` in the
 //! `github.com/rust-bitcoin/rust-bitcoin/bitcoin/examples/` directory.
 
-#![cfg_attr(not(feature = "std"), no_std)]
-// Experimental features we need.
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![no_std]
 // Coding conventions.
 #![warn(missing_docs)]
 #![doc(test(attr(warn(unused))))]
 // Pedantic lints that we enforce.
 #![warn(clippy::return_self_not_must_use)]
-// Exclude lints we don't think are valuable.
-#![allow(clippy::needless_question_mark)] // https://github.com/rust-bitcoin/rust-bitcoin/pull/2134
-#![allow(clippy::manual_range_contains)] // More readable than clippy's format.
-#![allow(clippy::uninlined_format_args)] // Allow `format!("{}", x)`instead of enforcing `format!("{x}")`
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
+
+#[cfg(feature = "std")]
+extern crate std;
+
+pub extern crate encoding;
 
 #[cfg(feature = "hashes")]
 pub extern crate hashes;
 
 #[cfg(feature = "std")]
 mod bridge;
-mod error;
+pub mod error;
 
 #[cfg(feature = "hashes")]
 mod hash;
 
-#[cfg(all(not(feature = "std"), feature = "alloc"))]
+#[cfg(feature = "alloc")]
+#[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 use core::cmp;
-
 #[cfg(feature = "std")]
-pub use bridge::{FromStd, ToStd};
+use std::vec::Vec;
+
+use encoding::{Decode, Decoder, Encoder};
 
 #[rustfmt::skip]                // Keep public re-exports separate.
-pub use self::error::{Error, ErrorKind};
+#[doc(no_inline)]
+pub use self::error::{Error, ErrorKind, ReadError};
+#[cfg(feature = "std")]
+pub use self::bridge::{FromStd, ToStd};
 #[cfg(feature = "hashes")]
 pub use self::hash::hash_reader;
 
@@ -60,9 +64,11 @@ pub type Result<T> = core::result::Result<T, Error>;
 pub trait Read {
     /// Reads bytes from source into `buf`.
     ///
-    /// # Returns
+    /// Returns the number of bytes read if successful or an [`Error`] if reading fails.
     ///
-    /// The number of bytes read if successful or an [`Error`] if reading fails.
+    /// # Errors
+    ///
+    /// If the underlying reader encounters an I/O error.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
 
     /// Reads bytes from source until `buf` is full.
@@ -85,7 +91,12 @@ pub trait Read {
 
     /// Constructs a new adapter which will read at most `limit` bytes.
     #[inline]
-    fn take(&mut self, limit: u64) -> Take<'_, Self> { Take { reader: self, remaining: limit } }
+    fn take(self, limit: u64) -> Take<Self>
+    where
+        Self: Sized,
+    {
+        Take { reader: self, remaining: limit }
+    }
 
     /// Attempts to read up to limit bytes from the reader, allocating space in `buf` as needed.
     ///
@@ -94,9 +105,11 @@ pub trait Read {
     ///
     /// Similar to [`std::io::Read::read_to_end`] but with the DOS protection.
     ///
-    /// # Returns
+    /// Returns the number of bytes read if successful or an [`Error`] if reading fails.
     ///
-    /// The number of bytes read if successful or an [`Error`] if reading fails.
+    /// # Errors
+    ///
+    /// If an I/O error occurs while reading from the underlying reader.
     #[doc(alias = "read_to_end")]
     #[cfg(feature = "alloc")]
     #[inline]
@@ -118,7 +131,7 @@ pub trait BufRead: Read {
     ///
     /// # Panics
     ///
-    /// May panic if `amount` is greater than amount of data read by `fill_buf`.
+    /// May panic if `amount` is greater than the amount of data read by `fill_buf`.
     fn consume(&mut self, amount: usize);
 }
 
@@ -126,19 +139,21 @@ pub trait BufRead: Read {
 ///
 /// Created by calling `[Read::take]`.
 #[derive(Debug)]
-pub struct Take<'a, R: Read + ?Sized> {
-    reader: &'a mut R,
+pub struct Take<R> {
+    reader: R,
     remaining: u64,
 }
 
-impl<R: Read + ?Sized> Take<'_, R> {
+impl<R: Read> Take<R> {
     /// Reads all bytes until EOF from the underlying reader into `buf`.
     ///
     /// Allocates space in `buf` as needed.
     ///
-    /// # Returns
+    /// Returns the number of bytes read if successful or an [`Error`] if reading fails.
     ///
-    /// The number of bytes read if successful or an [`Error`] if reading fails.
+    /// # Errors
+    ///
+    /// If an I/O error occurs while reading from the underlying reader.
     #[cfg(feature = "alloc")]
     #[inline]
     pub fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
@@ -159,9 +174,14 @@ impl<R: Read + ?Sized> Take<'_, R> {
     }
 }
 
-impl<R: Read + ?Sized> Read for Take<'_, R> {
+impl<R: Read> Read for Take<R> {
     #[inline]
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        // Don't call into inner reader at all at EOF because it may still block
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+
         let len = cmp::min(buf.len(), self.remaining.try_into().unwrap_or(buf.len()));
         let read = self.reader.read(&mut buf[..len])?;
         self.remaining -= read.try_into().unwrap_or(self.remaining);
@@ -170,7 +190,7 @@ impl<R: Read + ?Sized> Read for Take<'_, R> {
 }
 
 // Impl copied from Rust stdlib.
-impl<R: BufRead + ?Sized> BufRead for Take<'_, R> {
+impl<R: BufRead> BufRead for Take<R> {
     #[inline]
     fn fill_buf(&mut self) -> Result<&[u8]> {
         // Don't call into inner reader at all at EOF because it may still block
@@ -193,7 +213,7 @@ impl<R: BufRead + ?Sized> BufRead for Take<'_, R> {
     }
 }
 
-impl<T: Read> Read for &'_ mut T {
+impl<T: Read + ?Sized> Read for &'_ mut T {
     #[inline]
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> { (**self).read(buf) }
 
@@ -201,7 +221,7 @@ impl<T: Read> Read for &'_ mut T {
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> { (**self).read_exact(buf) }
 }
 
-impl<T: BufRead> BufRead for &'_ mut T {
+impl<T: BufRead + ?Sized> BufRead for &'_ mut T {
     #[inline]
     fn fill_buf(&mut self) -> Result<&[u8]> { (**self).fill_buf() }
 
@@ -228,7 +248,7 @@ impl BufRead for &[u8] {
     fn consume(&mut self, amount: usize) { *self = &self[amount..] }
 }
 
-/// Wraps an in memory reader providing the `position` function.
+/// Wraps an in memory buffer providing `position` functionality for read and write.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Cursor<T> {
     inner: T,
@@ -238,9 +258,9 @@ pub struct Cursor<T> {
 impl<T: AsRef<[u8]>> Cursor<T> {
     /// Constructs a new `Cursor` by wrapping `inner`.
     #[inline]
-    pub const fn new(inner: T) -> Self { Cursor { inner, pos: 0 } }
+    pub const fn new(inner: T) -> Self { Self { inner, pos: 0 } }
 
-    /// Returns the position read up to thus far.
+    /// Returns the position read or written up to thus far.
     #[inline]
     pub const fn position(&self) -> u64 { self.pos }
 
@@ -249,7 +269,7 @@ impl<T: AsRef<[u8]>> Cursor<T> {
     /// This method allows seeking within the wrapped memory by setting the position.
     ///
     /// Note that setting a position that is larger than the buffer length will cause reads to
-    /// succeed by reading zero bytes.
+    /// succeed by reading zero bytes. Further, writes will be no-op zero length writes.
     #[inline]
     pub fn set_position(&mut self, position: u64) { self.pos = position; }
 
@@ -275,7 +295,7 @@ impl<T: AsRef<[u8]>> Cursor<T> {
     ///
     /// This is the whole wrapped buffer, including the bytes already read.
     #[inline]
-    #[deprecated(since = "TBD", note = "use `get_ref()` instead")]
+    #[deprecated(since = "0.3.0", note = "use `get_ref()` instead")]
     pub fn inner(&self) -> &T { &self.inner }
 }
 
@@ -299,14 +319,26 @@ impl<T: AsRef<[u8]>> BufRead for Cursor<T> {
     #[inline]
     fn fill_buf(&mut self) -> Result<&[u8]> {
         let inner: &[u8] = self.inner.as_ref();
-        Ok(&inner[self.pos as usize..])
+        let pos = self.pos.min(inner.len() as u64) as usize;
+        Ok(&inner[pos..])
     }
 
     #[inline]
-    fn consume(&mut self, amount: usize) {
-        assert!(amount <= self.inner.as_ref().len());
-        self.pos += amount as u64;
+    fn consume(&mut self, amount: usize) { self.pos = self.pos.saturating_add(amount as u64); }
+}
+
+impl<T: AsMut<[u8]>> Write for Cursor<T> {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        let write_slice = self.inner.as_mut();
+        let pos = cmp::min(self.pos, write_slice.len() as u64);
+        let amt = (&mut write_slice[(pos as usize)..]).write(buf)?;
+        self.pos += amt as u64;
+        Ok(amt)
     }
+
+    #[inline]
+    fn flush(&mut self) -> Result<()> { Ok(()) }
 }
 
 /// A generic trait describing an output stream.
@@ -314,18 +346,30 @@ impl<T: AsRef<[u8]>> BufRead for Cursor<T> {
 /// See [`std::io::Write`] for more information.
 pub trait Write {
     /// Writes `buf` into this writer, returning how many bytes were written.
+    ///
+    /// # Errors
+    ///
+    /// If an I/O error occurs while writing to the underlying writer.
     fn write(&mut self, buf: &[u8]) -> Result<usize>;
 
     /// Flushes this output stream, ensuring that all intermediately buffered contents
     /// reach their destination.
+    ///
+    /// # Errors
+    ///
+    /// If an I/O error occurs while flushing the underlying writer.
     fn flush(&mut self) -> Result<()>;
 
     /// Attempts to write an entire buffer into this writer.
+    ///
+    /// # Errors
+    ///
+    /// If an I/O error occurs while writing to the underlying writer.
     #[inline]
     fn write_all(&mut self, mut buf: &[u8]) -> Result<()> {
         while !buf.is_empty() {
             match self.write(buf) {
-                Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+                Ok(0) => return Err(ErrorKind::WriteZero.into()),
                 Ok(len) => buf = &buf[len..],
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
@@ -408,12 +452,229 @@ pub const fn from_std<T>(std_io: T) -> FromStd<T> { FromStd::new(std_io) }
 #[inline]
 pub fn from_std_mut<T>(std_io: &mut T) -> &mut FromStd<T> { FromStd::new_mut(std_io) }
 
+/// Encodes a `consensus_encoding` object to an I/O writer.
+///
+/// # Errors
+///
+/// If an I/O error occurs while writing to the underlying writer.
+pub fn encode_to_writer<T, W>(object: &T, writer: W) -> Result<()>
+where
+    T: encoding::Encode + ?Sized,
+    W: Write,
+{
+    let mut encoder = object.encoder();
+    drain_to_writer(&mut encoder, writer)
+}
+
+/// Drains the output of an [`Encoder`] to an I/O writer.
+///
+/// See [`encode_to_writer`] for more information.
+///
+/// # Errors
+///
+/// Returns any I/O error encountered while writing to the writer.
+pub fn drain_to_writer<T, W>(encoder: &mut T, mut writer: W) -> Result<()>
+where
+    T: Encoder + ?Sized,
+    W: Write,
+{
+    loop {
+        writer.write_all(encoder.current_chunk())?;
+        if encoder.advance().has_finished() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Decodes an object from a buffered reader.
+///
+/// # Performance
+///
+/// For unbuffered readers (like [`std::fs::File`] or [`std::net::TcpStream`]), consider wrapping
+/// your reader with [`std::io::BufReader`] in order to use this function. This avoids frequent
+/// small reads, which can significantly impact performance.
+///
+/// # Errors
+///
+/// Returns [`ReadError::Decode`] if the decoder encounters an error while parsing
+/// the data, or [`ReadError::Io`] if an I/O error occurs while reading.
+pub fn decode_from_read<T, R>(
+    reader: R,
+) -> core::result::Result<T, ReadError<<T::Decoder as Decoder>::Error>>
+where
+    T: Decode,
+    R: BufRead,
+{
+    decode_from_read_internal(reader, T::decoder())
+}
+
+/// Decodes an object from a buffered reader using a [`Decoder`] type.
+///
+/// Unlike [`decode_from_read`], this takes a generic [`Decoder`] parameter, allowing use with
+/// decoders which don't have a dedicated [`Decode`] implementer.
+///
+/// # Performance
+///
+/// For unbuffered readers (like [`std::fs::File`] or [`std::net::TcpStream`]), consider wrapping
+/// your reader with [`std::io::BufReader`] in order to use this function. This avoids frequent
+/// small reads, which can significantly impact performance.
+///
+/// # Errors
+///
+/// Returns [`ReadError::Decode`] if the decoder encounters an error while parsing
+/// the data, or [`ReadError::Io`] if an I/O error occurs while reading.
+pub fn decode_from_read_with<D, R>(
+    reader: R,
+) -> core::result::Result<D::Output, ReadError<D::Error>>
+where
+    D: Decoder + Default,
+    R: BufRead,
+{
+    decode_from_read_internal(reader, D::default())
+}
+
+fn decode_from_read_internal<D, R>(
+    mut reader: R,
+    mut decoder: D,
+) -> core::result::Result<D::Output, ReadError<D::Error>>
+where
+    D: Decoder + Default,
+    R: BufRead,
+{
+    loop {
+        let mut buffer = match reader.fill_buf() {
+            Ok(buffer) => buffer,
+            // Auto retry read for non-fatal error.
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(ReadError::Io(error)),
+        };
+
+        if buffer.is_empty() {
+            // EOF, but still try to finalize the decoder.
+            return decoder.end().map_err(ReadError::Decode);
+        }
+
+        let original_len = buffer.len();
+        let status = decoder.push_bytes(&mut buffer).map_err(ReadError::Decode)?;
+        let consumed = original_len - buffer.len();
+        reader.consume(consumed);
+
+        if status.is_ready() {
+            return decoder.end().map_err(ReadError::Decode);
+        }
+    }
+}
+
+/// Decodes an object from an unbuffered reader using a fixed-size buffer.
+///
+/// For most use cases, prefer [`decode_from_read`] with a [`std::io::BufReader`].
+/// This function is only needed when you have an unbuffered reader which you
+/// cannot wrap. It will probably have worse performance.
+///
+/// # Buffer
+///
+/// Uses a fixed 4KB (4096 bytes) stack-allocated buffer that is reused across
+/// read operations. This size is a good balance between memory usage and
+/// system call efficiency for most use cases.
+///
+/// For different buffer sizes, use [`decode_from_read_unbuffered_with`].
+///
+/// # Errors
+///
+/// Returns [`ReadError::Decode`] if the decoder encounters an error while parsing
+/// the data, or [`ReadError::Io`] if an I/O error occurs while reading.
+pub fn decode_from_read_unbuffered<T, R>(
+    reader: R,
+) -> core::result::Result<T, ReadError<<T::Decoder as Decoder>::Error>>
+where
+    T: Decode,
+    R: Read,
+{
+    decode_from_read_unbuffered_with::<T, R, 4096>(reader)
+}
+
+/// Decodes an object from an unbuffered reader using a custom-sized buffer.
+///
+/// For most use cases, prefer [`decode_from_read`] with a [`std::io::BufReader`].
+/// This function is only needed when you have an unbuffered reader which you
+/// cannot wrap. It will probably have worse performance.
+///
+/// # Buffer
+///
+/// The `BUFFER_SIZE` parameter controls the intermediate buffer size used for
+/// reading. The buffer is allocated on the stack (not heap) and reused across
+/// read operations. Larger buffers reduce the number of system calls, but use
+/// more memory.
+///
+/// # Errors
+///
+/// Returns [`ReadError::Decode`] if the decoder encounters an error while parsing
+/// the data, or [`ReadError::Io`] if an I/O error occurs while reading.
+pub fn decode_from_read_unbuffered_with<T, R, const BUFFER_SIZE: usize>(
+    mut reader: R,
+) -> core::result::Result<T, ReadError<<T::Decoder as Decoder>::Error>>
+where
+    T: Decode,
+    R: Read,
+{
+    let mut decoder = T::decoder();
+    let mut buffer = [0u8; BUFFER_SIZE];
+
+    while decoder.read_limit() > 0 {
+        // Only read what we need, up to buffer size.
+        let clamped_buffer = &mut buffer[..decoder.read_limit().min(BUFFER_SIZE)];
+        match reader.read(clamped_buffer) {
+            Ok(0) => {
+                // EOF, but still try to finalize the decoder.
+                return decoder.end().map_err(ReadError::Decode);
+            }
+            Ok(bytes_read) => {
+                let mut to_push = &clamped_buffer[..bytes_read];
+                while !to_push.is_empty() {
+                    if decoder.push_bytes(&mut to_push).map_err(ReadError::Decode)?.is_ready() {
+                        return decoder.end().map_err(ReadError::Decode);
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => {
+                // Auto retry read for non-fatal error.
+            }
+            Err(e) => return Err(ReadError::Io(e)),
+        }
+    }
+
+    decoder.end().map_err(ReadError::Decode)
+}
+
+#[cfg(feature = "std")]
+include!("../include/newtype.rs"); // Explained in `REPO_DIR/docs/README.md`.
+
 #[cfg(test)]
 mod tests {
-    #[cfg(all(not(feature = "std"), feature = "alloc"))]
+    #[cfg(feature = "alloc")]
+    #[cfg(not(feature = "std"))]
     use alloc::{string::ToString, vec};
+    #[cfg(feature = "std")]
+    use std::{string::ToString, vec};
+
+    use encoding::{ArrayDecoder, ArrayEncoder, UnexpectedEofError};
 
     use super::*;
+
+    struct ZeroWriter;
+
+    impl Write for ZeroWriter {
+        fn write(&mut self, _: &[u8]) -> Result<usize> { Ok(0) }
+
+        fn flush(&mut self) -> Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn write_all_returns_write_zero_when_writer_makes_no_progress() {
+        let err = ZeroWriter.write_all(b"bitcoin").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::WriteZero);
+    }
 
     #[test]
     fn buf_read_fill_and_consume_slice() {
@@ -446,7 +707,7 @@ mod tests {
         // 32 is greater than the reader length.
         let read = reader.read_to_limit(&mut buf, 32).expect("failed to read to limit");
         assert_eq!(read, s.len());
-        assert_eq!(&buf, s.as_bytes())
+        assert_eq!(&buf, s.as_bytes());
     }
 
     #[test]
@@ -458,7 +719,7 @@ mod tests {
 
         let read = reader.read_to_limit(&mut buf, 2).expect("failed to read to limit");
         assert_eq!(read, 2);
-        assert_eq!(&buf, "16".as_bytes())
+        assert_eq!(&buf, "16".as_bytes());
     }
 
     #[test]
@@ -469,7 +730,7 @@ mod tests {
 
         let v = [1_u8; BUF_LEN];
 
-        // Sanity check the stdlib Cursor's behaviour.
+        // Sanity check the stdlib Cursor's behavior.
         let mut c = std::io::Cursor::new(v);
         for pos in [BUF_LEN, BUF_LEN + 1, BUF_LEN * 2] {
             c.set_position(pos as u64);
@@ -504,6 +765,24 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_take_does_not_read_inner_reader() {
+        use crate::Read as _;
+
+        /// A reader that errors on every call, to detect any call into the inner reader.
+        struct ErrorReader;
+
+        impl Read for ErrorReader {
+            fn read(&mut self, _buf: &mut [u8]) -> Result<usize> { Err(ErrorKind::Other.into()) }
+        }
+
+        let mut take = ErrorReader.take(0);
+        let mut buf = [0_u8; 1];
+
+        // A `Take` that has no bytes left must report EOF without calling the inner reader.
+        assert_eq!(take.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
     #[cfg(feature = "alloc")]
     fn take_and_read_to_end() {
         const BUF_LEN: usize = 64;
@@ -516,5 +795,247 @@ mod tests {
         let read = take.read_to_end(&mut v).unwrap();
         assert_eq!(read, 32);
         assert_eq!(data[0..32], v[0..32]);
+    }
+
+    #[test]
+    fn cursor_fill_buf_past_end() {
+        let data = [1, 2, 3];
+        let mut cursor = Cursor::new(&data);
+        cursor.set_position(10);
+
+        let buf = cursor.fill_buf().unwrap();
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn cursor_write() {
+        let data = [0x78, 0x56, 0x34, 0x12];
+
+        let mut buf = [0_u8; 4];
+        let mut cursor = Cursor::new(&mut buf);
+        let amt = cursor.write(&data).unwrap();
+
+        assert_eq!(buf, data);
+        assert_eq!(amt, 4);
+    }
+
+    #[test]
+    fn cursor_offset_write() {
+        let data = [0x78, 0x56, 0x34, 0x12];
+
+        let mut buf = [0_u8; 4];
+        let mut cursor = Cursor::new(&mut buf);
+        cursor.set_position(2);
+        let amt = cursor.write(&data).unwrap();
+
+        assert_eq!(buf, [0, 0, 0x78, 0x56]);
+        assert_eq!(amt, 2);
+    }
+
+    #[test]
+    fn cursor_consume_past_end() {
+        let data = [1, 2, 3];
+        let mut cursor = Cursor::new(&data);
+        cursor.set_position(10);
+
+        cursor.consume(5);
+        assert_eq!(cursor.position(), 15);
+    }
+
+    // Simple test type that implements Encode.
+    struct TestData(u32);
+
+    impl encoding::Encode for TestData {
+        type Encoder<'e>
+            = ArrayEncoder<4>
+        where
+            Self: 'e;
+
+        fn encoder(&self) -> Self::Encoder<'_> {
+            ArrayEncoder::without_length_prefix(self.0.to_le_bytes())
+        }
+    }
+
+    #[test]
+    fn encode_io_writer() {
+        let data = TestData(0x1234_5678);
+
+        let mut buf = [0_u8; 4];
+        encode_to_writer(&data, buf.as_mut_slice()).unwrap();
+
+        assert_eq!(buf, [0x78, 0x56, 0x34, 0x12]);
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct TestArray([u8; 4]);
+
+    impl Decode for TestArray {
+        type Decoder = TestArrayDecoder;
+    }
+
+    #[derive(Default)]
+    struct TestArrayDecoder {
+        inner: ArrayDecoder<4>,
+    }
+
+    impl Decoder for TestArrayDecoder {
+        type Output = TestArray;
+        type Error = UnexpectedEofError;
+
+        fn push_bytes(
+            &mut self,
+            bytes: &mut &[u8],
+        ) -> core::result::Result<encoding::DecoderStatus, Self::Error> {
+            self.inner.push_bytes(bytes)
+        }
+
+        fn end(self) -> core::result::Result<Self::Output, Self::Error> {
+            self.inner.end().map(TestArray)
+        }
+
+        fn read_limit(&self) -> usize { self.inner.read_limit() }
+    }
+
+    #[test]
+    fn decode_from_read_success() {
+        let data = [1, 2, 3, 4];
+        let cursor = Cursor::new(&data);
+        let result: core::result::Result<TestArray, _> = decode_from_read(cursor);
+        assert!(result.is_ok());
+        let decoded = result.unwrap();
+        assert_eq!(decoded.0, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn decode_from_read_unexpected_eof() {
+        let data = [1, 2, 3];
+        let cursor = Cursor::new(&data);
+        let result: core::result::Result<TestArray, _> = decode_from_read(cursor);
+        assert!(matches!(result, Err(ReadError::Decode(_))));
+    }
+
+    #[test]
+    fn decode_from_read_trait_object() {
+        let data = [1, 2, 3, 4];
+        let mut cursor = Cursor::new(&data);
+        // Test that we can pass a trait object (&mut dyn BufRead implements BufRead).
+        let reader: &mut dyn BufRead = &mut cursor;
+        let result: core::result::Result<TestArray, _> = decode_from_read(reader);
+        assert!(result.is_ok());
+        let decoded = result.unwrap();
+        assert_eq!(decoded.0, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decode_from_read_by_reference() {
+        use crate::alloc::vec::Vec;
+
+        let data = [1, 2, 3, 4];
+        let mut cursor = Cursor::new(&data);
+        // Test that we can pass by reference (&mut T implements BufRead when T: BufRead).
+        let result: core::result::Result<TestArray, _> = decode_from_read(&mut cursor);
+        assert!(result.is_ok());
+        let decoded = result.unwrap();
+        assert_eq!(decoded.0, [1, 2, 3, 4]);
+
+        let mut buf = Vec::new();
+        let _ = cursor.read_to_limit(&mut buf, 100);
+    }
+
+    #[test]
+    fn decode_from_read_unbuffered_success() {
+        let data = [1, 2, 3, 4];
+        let cursor = Cursor::new(&data);
+        let result: core::result::Result<TestArray, _> = decode_from_read_unbuffered(cursor);
+        assert!(result.is_ok());
+        let decoded = result.unwrap();
+        assert_eq!(decoded.0, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn decode_from_read_unbuffered_unexpected_eof() {
+        let data = [1, 2, 3];
+        let cursor = Cursor::new(&data);
+        let result: core::result::Result<TestArray, _> = decode_from_read_unbuffered(cursor);
+        assert!(matches!(result, Err(ReadError::Decode(_))));
+    }
+
+    #[test]
+    fn decode_from_read_unbuffered_empty() {
+        let data = [];
+        let cursor = Cursor::new(&data);
+        let result: core::result::Result<TestArray, _> = decode_from_read_unbuffered(cursor);
+        assert!(matches!(result, Err(ReadError::Decode(_))));
+    }
+
+    #[test]
+    fn decode_from_read_unbuffered_extra_data() {
+        let data = [1, 2, 3, 4, 5, 6];
+        let cursor = Cursor::new(&data);
+        let result: core::result::Result<TestArray, _> = decode_from_read_unbuffered(cursor);
+        assert!(result.is_ok());
+        let decoded = result.unwrap();
+        assert_eq!(decoded.0, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decode_from_read_unbuffered_partial_consume() {
+        use encoding::DecoderStatus;
+
+        // Consumes one byte per push_bytes call. Returns Ready after
+        // it has accumulated 4 bytes. Checks for correct behaviour on
+        // partial consumption in push_bytes.
+        #[derive(Default)]
+        struct OneAtATimeDecoder {
+            buf: Vec<u8>,
+        }
+
+        #[derive(Debug, PartialEq)]
+        struct OneAtATime(Vec<u8>);
+
+        #[derive(Debug)]
+        struct OneAtATimeError;
+
+        impl Decoder for OneAtATimeDecoder {
+            type Output = OneAtATime;
+            type Error = OneAtATimeError;
+
+            fn push_bytes(
+                &mut self,
+                bytes: &mut &[u8],
+            ) -> core::result::Result<DecoderStatus, Self::Error> {
+                if self.buf.len() < 4 && !bytes.is_empty() {
+                    self.buf.push(bytes[0]);
+                    *bytes = &bytes[1..];
+                }
+                if self.buf.len() == 4 {
+                    Ok(DecoderStatus::Ready)
+                } else {
+                    Ok(DecoderStatus::NeedsMore)
+                }
+            }
+
+            fn end(self) -> core::result::Result<Self::Output, Self::Error> {
+                if self.buf.len() == 4 {
+                    Ok(OneAtATime(self.buf))
+                } else {
+                    Err(OneAtATimeError)
+                }
+            }
+
+            fn read_limit(&self) -> usize { 4 - self.buf.len() }
+        }
+
+        impl Decode for OneAtATime {
+            type Decoder = OneAtATimeDecoder;
+        }
+
+        let data = [0x11, 0x22, 0x33, 0x44];
+        let cursor = Cursor::new(&data);
+        let decoded: OneAtATime =
+            decode_from_read_unbuffered_with::<_, _, 16>(cursor).expect("decode succeeds");
+        assert_eq!(decoded.0, vec![0x11, 0x22, 0x33, 0x44]);
     }
 }

@@ -1,23 +1,58 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! # Rust Bitcoin - primitive types
+//! # Rust Bitcoin Primitive Types
 //!
 //! Primitive data types that are used throughout the [`rust-bitcoin`] ecosystem.
+//!
+//! If you are using `rust-bitcoin` then you do not need to access this crate directly. Everything
+//! here is re-exported in `rust-bitcoin` at the same path.
 //!
 //! This crate can be used in a no-std environment but a lot of the functionality requires an
 //! allocator i.e., requires the `alloc` feature to be enabled.
 //!
-//! [`rust-bitcoin`]: <https://github.com/rust-bitcoin>
+//! ## Features
+//!
+//! * `std` (default) - turns on `std` integration, mainly the `std::error::Error` trait. Implies
+//!   `alloc`.
+//! * `alloc` - turns on the types that require an allocator, such as `Transaction`, `Block`,
+//!   `Witness` and the script types.
+//! * `hex` (default) - turns on parsing and formatting types as hex strings.
+//! * `serde` - causes the crate to depend on `serde` and provide support for serializing and
+//!   deserializing its types. Implies `alloc` and `hex`.
+//! * `arbitrary` - causes the crate to depend on `arbitrary` and implement the `Arbitrary` trait.
+//!
+//! ### serde
+//!
+//! The consensus encodable types ([`Block`], [`block::Header`], [`Transaction`], [`TxIn`], and
+//! [`TxOut`]) deliberately do not implement serde traits. Instead, they can be de/serialized with
+//! the [`encoding::serde_as_consensus`] module.
+//!
+//! ```rust
+//! # #[cfg(feature = "serde")] {
+//! use serde::{Deserialize, Serialize};
+//! use bitcoin_primitives::Transaction;
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct Foo {
+//!    #[serde(with = "bitcoin_primitives::encoding::serde_as_consensus")]
+//!    tx: Transaction,
+//! }
+//! # }
+//! ```
+//!
+//! ## MSRV
+//!
+//! This crate supports Rust 1.74, however some of its dependencies may not do so or may require
+//! pinning. Similarly, some features may require newer Rust version (implicitly or explicitly).
+//!
+//! [`rust-bitcoin`]: <https://github.com/rust-bitcoin/rust-bitcoin>
 
-#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
-// Experimental features we need.
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![no_std]
 // Coding conventions.
 #![warn(missing_docs)]
 #![warn(deprecated_in_future)]
 #![doc(test(attr(warn(unused))))]
-// Exclude lints we don't think are valuable.
-#![allow(clippy::uninlined_format_args)] // Allow `format!("{}", x)`instead of enforcing `format!("{x}")`
+// Package-specific lint overrides.
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -27,7 +62,15 @@ extern crate std;
 
 #[cfg(feature = "serde")]
 #[macro_use]
-extern crate serde;
+pub extern crate serde;
+
+#[cfg(feature = "arbitrary")]
+pub extern crate arbitrary;
+
+pub extern crate encoding;
+
+#[cfg(feature = "hex")]
+pub extern crate hex;
 
 #[doc(hidden)]
 pub mod _export {
@@ -37,28 +80,36 @@ pub mod _export {
     }
 }
 
+mod hash_types;
+
 pub mod block;
-pub mod locktime;
 pub mod merkle_tree;
-mod opcodes;
-pub mod pow;
+pub mod opcodes;
 #[cfg(feature = "alloc")]
 pub mod script;
-pub mod sequence;
 pub mod transaction;
 #[cfg(feature = "alloc")]
 pub mod witness;
+pub mod witness_version;
+
+#[cfg(feature = "hex")]
+mod hex_codec;
 
 #[doc(inline)]
 pub use units::{
     amount::{self, Amount, SignedAmount},
     block::{BlockHeight, BlockHeightInterval, BlockMtp, BlockMtpInterval},
     fee_rate::{self, FeeRate},
+    locktime::{self, absolute, relative},
+    parse_int,
+    pow::{self, CompactTarget, Target, Work},
+    result::{self, NumOpResult},
+    sequence::{self, Sequence},
     time::{self, BlockTime},
     weight::{self, Weight},
 };
 
-#[deprecated(since = "TBD", note = "use `BlockHeightInterval` instead")]
+#[deprecated(since = "1.0.0-rc.0", note = "use `BlockHeightInterval` instead")]
 #[doc(hidden)]
 pub type BlockInterval = BlockHeightInterval;
 
@@ -68,17 +119,17 @@ pub use self::{
     block::{
         Block, Checked as BlockChecked, Unchecked as BlockUnchecked, Validation as BlockValidation,
     },
-    script::{Script, ScriptBuf},
+    script::{
+        RedeemScript, RedeemScriptBuf, ScriptCode, ScriptPubKey, ScriptPubKeyBuf, ScriptSig,
+        ScriptSigBuf, SignetBlockScript, SignetBlockScriptBuf, TapScript, TapScriptBuf,
+        WitnessScript, WitnessScriptBuf,
+    },
     transaction::{Transaction, TxIn, TxOut},
     witness::Witness,
 };
 #[doc(inline)]
 pub use self::{
     block::{BlockHash, Header as BlockHeader, Version as BlockVersion, WitnessCommitment},
-    locktime::{absolute, relative},
-    merkle_tree::{TxMerkleNode, WitnessMerkleNode},
-    pow::CompactTarget,
-    sequence::Sequence,
     transaction::{OutPoint, Txid, Version as TransactionVersion, Wtxid},
 };
 
@@ -91,6 +142,34 @@ mod prelude {
     #[cfg(feature = "alloc")]
     pub use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::{Borrow, BorrowMut, Cow, ToOwned}, slice, rc};
 
-    #[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+    #[cfg(feature = "alloc")]
+    #[cfg(target_has_atomic = "ptr")]
     pub use alloc::sync;
 }
+
+#[cfg(not(feature = "alloc"))]
+pub mod script {
+    //! Bitcoin scripts.
+
+    #[doc(inline)]
+    pub use crate::hash_types::{ScriptHash, WScriptHash};
+}
+
+#[cfg(feature = "alloc")]
+use encoding::Encoder;
+#[cfg(feature = "alloc")]
+use internals::array_vec::ArrayVec;
+
+// Encode a compact size to a slice without allocating
+#[inline]
+#[cfg(feature = "alloc")]
+pub(crate) fn compact_size_encode(value: usize) -> ArrayVec<u8, 9> {
+    let encoder = encoding::CompactSizeEncoder::new(value);
+    ArrayVec::from_slice(encoder.current_chunk())
+}
+
+#[cfg(feature = "alloc")]
+include!("../include/newtype.rs"); // Explained in `REPO_DIR/docs/README.md`.
+include!("../include/decoder_newtype.rs"); // decoder_newtype! macro
+#[cfg(feature = "alloc")]
+include!("../include/asref_push_bytes.rs"); // impl_asref_push_bytes! macro

@@ -2,9 +2,9 @@
 
 //! Verification tests for the `amount` module.
 
-use std::cmp;
+use core::cmp;
 
-use super::*;
+use super::{Amount, SignedAmount};
 
 // Note regarding the `unwind` parameter: this defines how many iterations
 // of loops kani will unwind before handing off to the SMT solver. Basically

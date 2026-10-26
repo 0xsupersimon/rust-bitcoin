@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
-#[cfg(all(not(feature = "std"), feature = "alloc"))]
+//! Error types for the `io` crate.
+
+#[cfg(feature = "alloc")]
+#[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
 use core::fmt;
+#[cfg(feature = "std")]
+use std::boxed::Box;
+
+use internals::{write_err, write_err_unchecked_source};
 
 /// The `io` crate error type.
 #[derive(Debug)]
@@ -17,14 +24,15 @@ pub struct Error {
 
     #[cfg(feature = "std")]
     error: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
-    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    #[cfg(feature = "alloc")]
+    #[cfg(not(feature = "std"))]
     error: Option<Box<dyn fmt::Debug + Send + Sync + 'static>>,
 }
 
 impl Error {
     /// Constructs a new I/O error.
     #[cfg(feature = "std")]
-    pub fn new<E>(kind: ErrorKind, error: E) -> Error
+    pub fn new<E>(kind: ErrorKind, error: E) -> Self
     where
         E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
     {
@@ -32,8 +40,9 @@ impl Error {
     }
 
     /// Constructs a new I/O error.
-    #[cfg(all(feature = "alloc", not(feature = "std")))]
-    pub fn new<E: sealed::IntoBoxDynDebug>(kind: ErrorKind, error: E) -> Error {
+    #[cfg(feature = "alloc")]
+    #[cfg(not(feature = "std"))]
+    pub fn new<E: sealed::IntoBoxDynDebug>(kind: ErrorKind, error: E) -> Self {
         Self { kind, _not_unwind_safe: core::marker::PhantomData, error: Some(error.into()) }
     }
 
@@ -47,14 +56,15 @@ impl Error {
     }
 
     /// Returns a reference to this error.
-    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    #[cfg(feature = "alloc")]
+    #[cfg(not(feature = "std"))]
     pub fn get_ref(&self) -> Option<&(dyn fmt::Debug + Send + Sync + 'static)> {
         self.error.as_deref()
     }
 }
 
 impl From<ErrorKind> for Error {
-    fn from(kind: ErrorKind) -> Error {
+    fn from(kind: ErrorKind) -> Self {
         Self {
             kind,
             _not_unwind_safe: core::marker::PhantomData,
@@ -65,7 +75,7 @@ impl From<ErrorKind> for Error {
 }
 
 impl fmt::Display for Error {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> core::result::Result<(), core::fmt::Error> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.write_fmt(format_args!("I/O Error: {}", self.kind.description()))?;
         #[cfg(any(feature = "alloc", feature = "std"))]
         if let Some(e) = &self.error {
@@ -84,7 +94,7 @@ impl std::error::Error for Error {
 
 #[cfg(feature = "std")]
 impl From<std::io::Error> for Error {
-    fn from(o: std::io::Error) -> Error {
+    fn from(o: std::io::Error) -> Self {
         Self {
             kind: ErrorKind::from_std(o.kind()),
             _not_unwind_safe: core::marker::PhantomData,
@@ -95,9 +105,9 @@ impl From<std::io::Error> for Error {
 
 #[cfg(feature = "std")]
 impl From<Error> for std::io::Error {
-    fn from(o: Error) -> std::io::Error {
+    fn from(o: Error) -> Self {
         if let Some(err) = o.error {
-            std::io::Error::new(o.kind.to_std(), err)
+            Self::new(o.kind.to_std(), err)
         } else {
             o.kind.to_std().into()
         }
@@ -195,7 +205,44 @@ define_errorkind!(
     Other
 );
 
-#[cfg(all(feature = "alloc", not(feature = "std")))]
+/// An error that can occur when reading and decoding from a buffered reader.
+#[derive(Debug)]
+pub enum ReadError<D> {
+    /// An I/O error occurred while reading from the reader.
+    Io(Error),
+    /// The decoder encountered an error while parsing the data.
+    Decode(D),
+}
+
+impl<D: fmt::Display> fmt::Display for ReadError<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(e) => write_err!(f, "I/O error"; e),
+            Self::Decode(e) => write_err_unchecked_source!(f, "decode error"; e),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<D> std::error::Error for ReadError<D>
+where
+    D: fmt::Debug + fmt::Display + std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Decode(e) => Some(e),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<D> From<Error> for ReadError<D> {
+    fn from(e: Error) -> Self { Self::Io(e) }
+}
+
+#[cfg(feature = "alloc")]
+#[cfg(not(feature = "std"))]
 mod sealed {
     use alloc::boxed::Box;
     use alloc::string::String;

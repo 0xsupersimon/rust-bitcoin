@@ -12,13 +12,14 @@
 //!
 //! ```
 //! use bitcoin::network::Params;
-//! use bitcoin::{Script, ScriptBuf, Network, Target};
+//! use bitcoin::pow::TargetExt as _;
+//! use bitcoin::{SignetBlockScript, SignetBlockScriptBuf, Network, Target};
 //!
-//! const POW_TARGET_SPACING: u64 = 120; // Two minutes.
+//! const POW_TARGET_SPACING: u32 = 120; // Two minutes.
 //!
 //! pub struct CustomParams {
 //!     params: Params,
-//!     challenge_script: ScriptBuf,
+//!     challenge_script: SignetBlockScriptBuf,
 //! }
 //!
 //! impl CustomParams {
@@ -27,8 +28,8 @@
 //!         let mut params = Params::new(Network::Signet);
 //!         params.pow_target_spacing = POW_TARGET_SPACING;
 //!
-//!         // This would be something real (see BIP-325).
-//!         let challenge_script = ScriptBuf::new();
+//!         // This would be something real (see BIP-00325).
+//!         let challenge_script = SignetBlockScriptBuf::new();
 //!
 //!         Self {
 //!             params,
@@ -37,7 +38,7 @@
 //!     }
 //!
 //!     /// Returns the custom signet challenge script.
-//!     pub fn challenge_script(&self) -> &Script { &self.challenge_script }
+//!     pub fn challenge_script(&self) -> &SignetBlockScript { &self.challenge_script }
 //! }
 //!
 //! impl AsRef<Params> for CustomParams {
@@ -60,12 +61,11 @@
 //! # }
 //! ```
 
-use units::{BlockHeight, BlockHeightInterval};
-
-use super::{Network, TestnetVersion};
+use super::{Network, NetworkExt as _, TestnetVersion};
 #[cfg(doc)]
 use crate::pow::CompactTarget;
 use crate::pow::Target;
+use crate::{BlockHeight, BlockHeightInterval};
 
 /// Parameters that influence chain consensus.
 #[non_exhaustive]
@@ -73,16 +73,18 @@ use crate::pow::Target;
 pub struct Params {
     /// Network for which parameters are valid.
     pub network: Network,
-    /// Time when BIP16 becomes active.
+    /// Time when BIP-0016 becomes active.
     pub bip16_time: u32,
-    /// Block height at which BIP34 becomes active.
+    /// Block height at which BIP-0034 becomes active.
     pub bip34_height: BlockHeight,
-    /// Block height at which BIP65 becomes active.
+    /// Block height at which BIP-0065 becomes active.
     pub bip65_height: BlockHeight,
-    /// Block height at which BIP66 becomes active.
+    /// Block height at which BIP-0066 becomes active.
     pub bip66_height: BlockHeight,
+    /// Enforce BIP-0094 block storm mitigation.
+    pub enforce_bip94: bool,
     /// Minimum blocks including miner confirmation of the total of 2016 blocks in a retargeting period,
-    /// (nPowTargetTimespan / nPowTargetSpacing) which is also used for BIP9 deployments.
+    /// (nPowTargetTimespan / nPowTargetSpacing) which is also used for BIP-0009 deployments.
     /// Examples: 1916 for 95%, 1512 for testchains.
     pub rule_change_activation_threshold: BlockHeightInterval,
     /// Number of blocks with the same set of rules.
@@ -103,7 +105,7 @@ pub struct Params {
     /// compact-expressible values between Bitcoin Core's and the limit expressed here.
     pub max_attainable_target: Target,
     /// Expected amount of time to mine one block.
-    pub pow_target_spacing: u64,
+    pub pow_target_spacing: u32,
     /// Difficulty recalculation interval.
     pub pow_target_timespan: u32,
     /// Determines whether minimal difficulty may be used for blocks or not.
@@ -121,7 +123,7 @@ pub struct Params {
 /// [using-statics-or-consts]: <https://doc.rust-lang.org/reference/items/static-items.html#using-statics-or-consts>
 pub static MAINNET: Params = Params::MAINNET;
 /// The testnet3 parameters.
-#[deprecated(since = "0.33.0", note = "use `TESTNET3` instead")]
+#[deprecated(since = "TBD", note = "use `TESTNET3` instead")]
 pub static TESTNET: Params = Params::TESTNET3;
 /// The testnet3 parameters.
 pub static TESTNET3: Params = Params::TESTNET3;
@@ -135,16 +137,17 @@ pub static REGTEST: Params = Params::REGTEST;
 #[allow(deprecated)] // For `pow_limit`.
 impl Params {
     /// The mainnet parameters (alias for `Params::MAINNET`).
-    pub const BITCOIN: Params = Params::MAINNET;
+    pub const BITCOIN: Self = Self::MAINNET;
 
     /// The mainnet parameters.
-    pub const MAINNET: Params = Params {
+    pub const MAINNET: Self = Self {
         network: Network::Bitcoin,
         bip16_time: 1333238400,                      // Apr 1 2012
         bip34_height: BlockHeight::from_u32(227931), // 000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8
         bip65_height: BlockHeight::from_u32(388381), // 000000000000000004c2b624ed5d7756c508d90fd0da2c7c679febfa6c4735f0
         bip66_height: BlockHeight::from_u32(363725), // 00000000000000000379eaa19dce8c9b722d46ae6a57c2f1a988119488b50931
-        rule_change_activation_threshold: BlockHeightInterval::from_u32(1916), // 95%
+        enforce_bip94: false,
+        rule_change_activation_threshold: BlockHeightInterval::from_u32(1815), // 90%
         miner_confirmation_window: BlockHeightInterval::from_u32(2016),
         pow_limit: Target::MAX_ATTAINABLE_MAINNET,
         max_attainable_target: Target::MAX_ATTAINABLE_MAINNET,
@@ -155,13 +158,14 @@ impl Params {
     };
 
     /// The testnet3 parameters.
-    #[deprecated(since = "0.33.0", note = "use `TESTNET3` instead")]
-    pub const TESTNET: Params = Params {
+    #[deprecated(since = "TBD", note = "use `TESTNET3` instead")]
+    pub const TESTNET: Self = Self {
         network: Network::Testnet(TestnetVersion::V3),
         bip16_time: 1333238400,                      // Apr 1 2012
         bip34_height: BlockHeight::from_u32(21111), // 0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8
         bip65_height: BlockHeight::from_u32(581885), // 00000000007f6655f22f98e72ed80d8b06dc761d5da09df0fa1dc4be4f861eb6
         bip66_height: BlockHeight::from_u32(330776), // 000000002104c8c45e99a8853285a3b592602a3ccde2b832481da85e9e4ba182
+        enforce_bip94: false,
         rule_change_activation_threshold: BlockHeightInterval::from_u32(1512), // 75%
         miner_confirmation_window: BlockHeightInterval::from_u32(2016),
         pow_limit: Target::MAX_ATTAINABLE_TESTNET,
@@ -173,12 +177,13 @@ impl Params {
     };
 
     /// The testnet3 parameters.
-    pub const TESTNET3: Params = Params {
+    pub const TESTNET3: Self = Self {
         network: Network::Testnet(TestnetVersion::V3),
         bip16_time: 1333238400,                      // Apr 1 2012
         bip34_height: BlockHeight::from_u32(21111), // 0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8
         bip65_height: BlockHeight::from_u32(581885), // 00000000007f6655f22f98e72ed80d8b06dc761d5da09df0fa1dc4be4f861eb6
         bip66_height: BlockHeight::from_u32(330776), // 000000002104c8c45e99a8853285a3b592602a3ccde2b832481da85e9e4ba182
+        enforce_bip94: false,
         rule_change_activation_threshold: BlockHeightInterval::from_u32(1512), // 75%
         miner_confirmation_window: BlockHeightInterval::from_u32(2016),
         pow_limit: Target::MAX_ATTAINABLE_TESTNET,
@@ -190,12 +195,13 @@ impl Params {
     };
 
     /// The testnet4 parameters.
-    pub const TESTNET4: Params = Params {
+    pub const TESTNET4: Self = Self {
         network: Network::Testnet(TestnetVersion::V4),
         bip16_time: 1333238400, // Apr 1 2012
         bip34_height: BlockHeight::from_u32(1),
         bip65_height: BlockHeight::from_u32(1),
         bip66_height: BlockHeight::from_u32(1),
+        enforce_bip94: true,
         rule_change_activation_threshold: BlockHeightInterval::from_u32(1512), // 75%
         miner_confirmation_window: BlockHeightInterval::from_u32(2016),
         pow_limit: Target::MAX_ATTAINABLE_TESTNET,
@@ -207,13 +213,14 @@ impl Params {
     };
 
     /// The signet parameters.
-    pub const SIGNET: Params = Params {
+    pub const SIGNET: Self = Self {
         network: Network::Signet,
         bip16_time: 1333238400, // Apr 1 2012
         bip34_height: BlockHeight::from_u32(1),
         bip65_height: BlockHeight::from_u32(1),
         bip66_height: BlockHeight::from_u32(1),
-        rule_change_activation_threshold: BlockHeightInterval::from_u32(1916), // 95%
+        enforce_bip94: false,
+        rule_change_activation_threshold: BlockHeightInterval::from_u32(1815), // 90%
         miner_confirmation_window: BlockHeightInterval::from_u32(2016),
         pow_limit: Target::MAX_ATTAINABLE_SIGNET,
         max_attainable_target: Target::MAX_ATTAINABLE_SIGNET,
@@ -224,36 +231,38 @@ impl Params {
     };
 
     /// The regtest parameters.
-    pub const REGTEST: Params = Params {
+    pub const REGTEST: Self = Self {
         network: Network::Regtest,
-        bip16_time: 1333238400,                         // Apr 1 2012
-        bip34_height: BlockHeight::from_u32(100000000), // not activated on regtest
-        bip65_height: BlockHeight::from_u32(1351),
-        bip66_height: BlockHeight::from_u32(1251), // used only in rpc tests
+        bip16_time: 1333238400,                 // Apr 1 2012
+        bip34_height: BlockHeight::from_u32(1), // Always active unless overridden
+        bip65_height: BlockHeight::from_u32(1), // Always active unless overridden
+        bip66_height: BlockHeight::from_u32(1), // Always active unless overridden
+        enforce_bip94: false,
         rule_change_activation_threshold: BlockHeightInterval::from_u32(108), // 75%
         miner_confirmation_window: BlockHeightInterval::from_u32(144),
         pow_limit: Target::MAX_ATTAINABLE_REGTEST,
         max_attainable_target: Target::MAX_ATTAINABLE_REGTEST,
-        pow_target_spacing: 10 * 60,            // 10 minutes.
-        pow_target_timespan: 14 * 24 * 60 * 60, // 2 weeks.
+        pow_target_spacing: 10 * 60,       // 10 minutes.
+        pow_target_timespan: 24 * 60 * 60, // one day.
         allow_min_difficulty_blocks: true,
         no_pow_retargeting: true,
     };
 
-    /// Creates parameters set for the given network.
+    /// Constructs parameters set for the given network.
     pub const fn new(network: Network) -> Self {
         match network {
-            Network::Bitcoin => Params::MAINNET,
-            Network::Testnet(TestnetVersion::V3) => Params::TESTNET3,
-            Network::Testnet(TestnetVersion::V4) => Params::TESTNET4,
-            Network::Signet => Params::SIGNET,
-            Network::Regtest => Params::REGTEST,
+            Network::Bitcoin => Self::MAINNET,
+            Network::Testnet(TestnetVersion::V3) => Self::TESTNET3,
+            Network::Testnet(TestnetVersion::V4) => Self::TESTNET4,
+            Network::Testnet(_) => Self::TESTNET3,
+            Network::Signet => Self::SIGNET,
+            Network::Regtest => Self::REGTEST,
         }
     }
 
     /// Calculates the number of blocks between difficulty adjustments.
-    pub fn difficulty_adjustment_interval(&self) -> u64 {
-        u64::from(self.pow_target_timespan) / self.pow_target_spacing
+    pub fn difficulty_adjustment_interval(&self) -> u32 {
+        self.pow_target_timespan / self.pow_target_spacing
     }
 }
 
@@ -273,8 +282,8 @@ impl From<&Network> for &'static Params {
     fn from(value: &Network) -> Self { value.params() }
 }
 
-impl AsRef<Params> for Params {
-    fn as_ref(&self) -> &Params { self }
+impl AsRef<Self> for Params {
+    fn as_ref(&self) -> &Self { self }
 }
 
 impl AsRef<Params> for Network {

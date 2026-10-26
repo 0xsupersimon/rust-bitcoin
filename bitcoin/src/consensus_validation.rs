@@ -4,18 +4,17 @@
 //!
 //! Relies on the `bitcoinconsensus` crate that uses Bitcoin Core libconsensus to perform validation.
 
-use core::convert::Infallible;
-use core::fmt;
-
-use internals::write_err;
-
 use crate::amount::Amount;
-use crate::consensus::encode;
 #[cfg(doc)]
 use crate::consensus_validation;
+use crate::encoding;
 use crate::internal_macros::define_extension_trait;
-use crate::script::Script;
+use crate::script::ScriptPubKey;
 use crate::transaction::{OutPoint, Transaction, TxOut};
+
+#[rustfmt::skip]                // Keep public re-exports separate.
+#[doc(no_inline)]
+pub use self::error::{BitcoinconsensusError, TxVerifyError};
 
 /// Verifies spend of an input script.
 ///
@@ -24,13 +23,13 @@ use crate::transaction::{OutPoint, Transaction, TxOut};
 ///
 /// # Parameters
 ///
-///  * `index` - The input index in spending which is spending this transaction.
-///  * `amount` - The amount this script guards.
-///  * `spending_tx` - The transaction that attempts to spend the output holding this script.
+///  * `index` - the input index in spending which is spending this transaction.
+///  * `amount` - the amount this script guards.
+///  * `spending_tx` - the transaction that attempts to spend the output holding this script.
 ///
 /// [`bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT`]: https://docs.rs/bitcoinconsensus/0.106.0+26.0/bitcoinconsensus/constant.VERIFY_ALL_PRE_TAPROOT.html
 pub fn verify_script(
-    script: &Script,
+    script: &ScriptPubKey,
     index: usize,
     amount: Amount,
     spending_tx: &[u8],
@@ -48,14 +47,14 @@ pub fn verify_script(
 ///
 /// # Parameters
 ///
-///  * `index` - The input index in spending which is spending this transaction.
-///  * `amount` - The amount this script guards.
-///  * `spending_tx` - The transaction that attempts to spend the output holding this script.
-///  * `flags` - Verification flags, see [`bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT`] and similar.
+///  * `index` - the input index in spending which is spending this transaction.
+///  * `amount` - the amount this script guards.
+///  * `spending_tx` - the transaction that attempts to spend the output holding this script.
+///  * `flags` - the verification flags, see [`bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT`] and similar.
 ///
 /// [`bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT`]: https://docs.rs/bitcoinconsensus/0.106.0+26.0/bitcoinconsensus/constant.VERIFY_ALL_PRE_TAPROOT.html
 pub fn verify_script_with_flags<F: Into<u32>>(
-    script: &Script,
+    script: &ScriptPubKey,
     index: usize,
     amount: Amount,
     spending_tx: &[u8],
@@ -99,14 +98,14 @@ where
     S: FnMut(&OutPoint) -> Option<TxOut>,
     F: Into<u32>,
 {
-    let serialized_tx = encode::serialize(tx);
+    let serialized_tx = encoding::encode_to_vec(tx);
     let flags: u32 = flags.into();
-    for (idx, input) in tx.input.iter().enumerate() {
+    for (idx, input) in tx.inputs.iter().enumerate() {
         if let Some(output) = spent(&input.previous_output) {
             verify_script_with_flags(
                 &output.script_pubkey,
                 idx,
-                output.value,
+                output.amount,
                 serialized_tx.as_slice(),
                 flags,
             )?;
@@ -118,17 +117,17 @@ where
 }
 
 define_extension_trait! {
-    /// Extension functionality to add validation support to the [`Script`] type.
-    pub trait ScriptExt impl for Script {
+    /// Extension functionality to add validation support to the [`ScriptPubKey`] type.
+    pub trait ScriptPubKeyExt impl for ScriptPubKey {
         /// Verifies spend of an input script.
         ///
         /// Shorthand for [`Self::verify_with_flags`] with flag [`bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT`].
         ///
         /// # Parameters
         ///
-        ///  * `index` - The input index in spending which is spending this transaction.
-        ///  * `amount` - The amount this script guards.
-        ///  * `spending_tx` - The transaction that attempts to spend the output holding this script.
+        ///  * `index` - the input index in spending which is spending this transaction.
+        ///  * `amount` - the amount this script guards.
+        ///  * `spending_tx` - the transaction that attempts to spend the output holding this script.
         ///
         /// [`bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT`]: https://docs.rs/bitcoinconsensus/0.106.0+26.0/bitcoinconsensus/constant.VERIFY_ALL_PRE_TAPROOT.html
         fn verify(
@@ -144,10 +143,10 @@ define_extension_trait! {
         ///
         /// # Parameters
         ///
-        ///  * `index` - The input index in spending which is spending this transaction.
-        ///  * `amount` - The amount this script guards.
-        ///  * `spending_tx` - The transaction that attempts to spend the output holding this script.
-        ///  * `flags` - Verification flags, see [`bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT`] and similar.
+        ///  * `index` - the input index in spending which is spending this transaction.
+        ///  * `amount` - the amount this script guards.
+        ///  * `spending_tx` - the transaction that attempts to spend the output holding this script.
+        ///  * `flags` - the verification flags, see [`bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT`] and similar.
         ///
         /// [`bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT`]: https://docs.rs/bitcoinconsensus/0.106.0+26.0/bitcoinconsensus/constant.VERIFY_ALL_PRE_TAPROOT.html
         fn verify_with_flags(
@@ -203,68 +202,76 @@ impl TransactionExt for Transaction {
 
 mod sealed {
     pub trait Sealed {}
-    impl Sealed for super::Script {}
+    impl Sealed for super::ScriptPubKey {}
     impl Sealed for super::Transaction {}
 }
 
-/// Wrapped error from `bitcoinconsensus`.
-// We do this for two reasons:
-// 1. We don't want the error to be part of the public API because we do not want to expose the
-//    unusual versioning used in `bitcoinconsensus` to users of `rust-bitcoin`.
-// 2. We want to implement `std::error::Error` if the "std" feature is enabled in `rust-bitcoin` but
-//    not in `bitcoinconsensus`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct BitcoinconsensusError(bitcoinconsensus::Error);
+/// Error types for consensus validation
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
 
-impl fmt::Display for BitcoinconsensusError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write_err!(f, "bitcoinconsensus error"; &self.0)
-    }
-}
+    use internals::write_err;
 
-#[cfg(all(feature = "std", feature = "bitcoinconsensus"))]
-impl std::error::Error for BitcoinconsensusError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
-}
+    use crate::transaction::OutPoint;
 
-/// An error during transaction validation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TxVerifyError {
-    /// Error validating the script with bitcoinconsensus library.
-    ScriptVerification(BitcoinconsensusError),
-    /// Can not find the spent output.
-    UnknownSpentOutput(OutPoint),
-}
+    /// Wrapped error from `bitcoinconsensus`.
+    // We do this for two reasons:
+    // 1. We don't want the error to be part of the public API because we do not want to expose the
+    //    unusual versioning used in `bitcoinconsensus` to users of `rust-bitcoin`.
+    // 2. We want to implement `std::error::Error` if the "std" feature is enabled in `rust-bitcoin` but
+    //    not in `bitcoinconsensus`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct BitcoinconsensusError(pub(super) bitcoinconsensus::Error);
 
-impl From<Infallible> for TxVerifyError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for TxVerifyError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use TxVerifyError::*;
-
-        match *self {
-            ScriptVerification(ref e) => write_err!(f, "bitcoinconsensus verification failed"; e),
-            UnknownSpentOutput(ref p) => write!(f, "unknown spent output: {}", p),
+    impl fmt::Display for BitcoinconsensusError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write_err!(f, "bitcoinconsensus error"; &self.0)
         }
     }
-}
 
-#[cfg(feature = "std")]
-impl std::error::Error for TxVerifyError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        use TxVerifyError::*;
+    #[cfg(feature = "bitcoinconsensus")]
+    #[cfg(feature = "std")]
+    impl std::error::Error for BitcoinconsensusError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
 
-        match *self {
-            ScriptVerification(ref e) => Some(e),
-            UnknownSpentOutput(_) => None,
+    /// An error during transaction validation.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum TxVerifyError {
+        /// Error validating the script with bitcoinconsensus library.
+        ScriptVerification(BitcoinconsensusError),
+        /// Cannot find the spent output.
+        UnknownSpentOutput(OutPoint),
+    }
+
+    impl From<Infallible> for TxVerifyError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for TxVerifyError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                Self::ScriptVerification(ref e) =>
+                    write_err!(f, "bitcoinconsensus verification failed"; e),
+                Self::UnknownSpentOutput(ref p) => write!(f, "unknown spent output: {}", p),
+            }
         }
     }
-}
 
-impl From<BitcoinconsensusError> for TxVerifyError {
-    fn from(e: BitcoinconsensusError) -> Self { TxVerifyError::ScriptVerification(e) }
+    #[cfg(feature = "std")]
+    impl std::error::Error for TxVerifyError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::ScriptVerification(ref e) => Some(e),
+                Self::UnknownSpentOutput(_) => None,
+            }
+        }
+    }
+
+    impl From<BitcoinconsensusError> for TxVerifyError {
+        fn from(e: BitcoinconsensusError) -> Self { Self::ScriptVerification(e) }
+    }
 }

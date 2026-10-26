@@ -2,8 +2,6 @@
 
 //! Bitcoin scripts.
 //!
-//! *[See also the `Script` type](Script).*
-//!
 //! This module provides the structures and functions needed to support scripts.
 //!
 //! <details>
@@ -11,7 +9,7 @@
 //!
 //! Scripts define Bitcoin's digital signature scheme: a signature is formed
 //! from a script (the second half of which is defined by a coin to be spent,
-//! and the first half provided by the spending transaction), and is valid iff
+//! and the first half provided by the spending transaction), and is valid if and only if
 //! the script leaves `TRUE` on the stack after being evaluated. Bitcoin's
 //! script is a stack-based assembly language similar in spirit to [Forth].
 //!
@@ -52,57 +50,55 @@ mod builder;
 mod instruction;
 mod owned;
 mod push_bytes;
+mod script_code;
 #[cfg(test)]
 mod tests;
-pub mod witness_program;
 pub mod witness_version;
 
-use core::convert::Infallible;
-use core::fmt;
-
-use io::{BufRead, Write};
-
 use self::witness_version::WitnessVersion;
-use crate::consensus::{encode, Decodable, Encodable};
-use crate::internal_macros::impl_asref_push_bytes;
 use crate::key::WPubkeyHash;
 use crate::opcodes::all::*;
 use crate::opcodes::Opcode;
-use crate::prelude::Vec;
-use crate::OutPoint;
 
 #[rustfmt::skip]                // Keep public re-exports separate.
 #[doc(inline)]
 pub use self::{
-    borrowed::ScriptExt,
-    builder::Builder,
+    borrowed::{ScriptExt, TapScriptExt, ScriptPubKeyExt, WitnessScriptExt, ScriptSigExt},
+    builder::{Builder, BuilderExt},
     instruction::{Instruction, Instructions, InstructionIndices},
-    owned::ScriptBufExt,
-    push_bytes::{PushBytes, PushBytesBuf, PushBytesError, PushBytesErrorReport},
+    owned::{ScriptBufExt, ScriptPubKeyBufExt, ScriptSigBufExt},
+    push_bytes::{PushBytes, PushBytesBuf, PushBytesExt, PushBytesErrorReport},
+    script_code::P2wpkhScriptCode
 };
 #[doc(inline)]
+pub use addresses::witness_program;
+#[doc(no_inline)]
+pub use primitives::script::ScriptBufDecoderError;
+#[doc(inline)]
 pub use primitives::script::{
-    RedeemScriptSizeError, Script, ScriptBuf, ScriptHash, WScriptHash, WitnessScriptSizeError,
+    RedeemScript, RedeemScriptBuf, RedeemScriptTag, Script, ScriptBuf, ScriptBufDecoder,
+    ScriptCode, ScriptCodeTag, ScriptEncoder, ScriptHash, ScriptHashableTag, ScriptPubKey,
+    ScriptPubKeyBuf, ScriptPubKeyTag, ScriptSig, ScriptSigBuf, ScriptSigTag, SignetBlockScript,
+    SignetBlockScriptBuf, SignetBlockScriptTag, Tag, TapScript, TapScriptBuf, TapScriptTag,
+    WScriptHash, WitnessScript, WitnessScriptBuf, WitnessScriptTag,
 };
 
 pub(crate) use self::borrowed::ScriptExtPriv;
+pub(in crate::blockdata) use self::builder::BuilderExtPriv;
+#[doc(no_inline)]
+pub use self::error::{
+    Error, PushBytesError, RedeemScriptError, RedeemScriptSizeError, ScriptIntError,
+    WitnessScriptSizeError,
+};
 pub(crate) use self::owned::ScriptBufExtPriv;
 
-impl_asref_push_bytes!(ScriptHash, WScriptHash);
-
-/// Constructs a new [`ScriptBuf`] containing the script code used for spending a P2WPKH output.
+/// Constructs a new [`P2wpkhScriptCode`] containing the script code used for spending a P2WPKH output.
 ///
-/// The `scriptCode` is described in [BIP143].
+/// The `scriptCode` is described in [BIP-0143].
 ///
-/// [BIP143]: <https://github.com/bitcoin/bips/blob/99701f68a88ce33b2d0838eb84e115cef505b4c2/bip-0143.mediawiki>
-pub fn p2wpkh_script_code(wpkh: WPubkeyHash) -> ScriptBuf {
-    Builder::new()
-        .push_opcode(OP_DUP)
-        .push_opcode(OP_HASH160)
-        .push_slice(wpkh)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_opcode(OP_CHECKSIG)
-        .into_script()
+/// [BIP-0143]: <https://github.com/bitcoin/bips/blob/99701f68a88ce33b2d0838eb84e115cef505b4c2/bip-0143.mediawiki>
+pub fn p2wpkh_script_code(wpkh: WPubkeyHash) -> P2wpkhScriptCode {
+    P2wpkhScriptCode::new_p2wpkh(wpkh)
 }
 
 /// Encodes an integer in script(minimal CScriptNum) format.
@@ -150,20 +146,21 @@ pub fn write_scriptint(out: &mut [u8; 8], n: i64) -> usize {
 ///
 /// See [`push_bytes::PushBytes::read_scriptint`] for a description of some subtleties of
 /// this function.
-pub fn read_scriptint_non_minimal(v: &[u8]) -> Result<i64, Error> {
+pub fn read_scriptint_non_minimal(v: &[u8]) -> Result<i32, ScriptIntError> {
     if v.is_empty() {
         return Ok(0);
     }
     if v.len() > 4 {
-        return Err(Error::NumericOverflow);
+        return Err(ScriptIntError::NumericOverflow);
     }
 
-    Ok(scriptint_parse(v))
+    let ret = scriptint_parse(v);
+    Ok(i32::try_from(ret).expect("4 bytes or less fits in an i32"))
 }
 
 // Caller to guarantee that `v` is not empty.
 fn scriptint_parse(v: &[u8]) -> i64 {
-    let (mut ret, sh) = v.iter().fold((0, 0), |(acc, sh), n| (acc + ((*n as i64) << sh), sh + 8));
+    let (mut ret, sh) = v.iter().fold((0, 0), |(acc, sh), n| (acc + (i64::from(*n) << sh), sh + 8));
     if v[v.len() - 1] & 0x80 != 0 {
         ret &= (1 << (sh - 1)) - 1;
         ret = -ret;
@@ -194,13 +191,15 @@ fn opcode_to_verify(opcode: Option<Opcode>) -> Option<Opcode> {
 }
 
 /// Generates P2WSH-type of scriptPubkey with a given [`WitnessVersion`] and the program bytes.
+///
 /// Does not do any checks on version or program length.
 ///
 /// Convenience method used by `new_p2a`, `new_p2wpkh`, `new_p2wsh`, `new_p2tr`, and `new_p2tr_tweaked`.
-pub(crate) fn new_witness_program_unchecked<T: AsRef<PushBytes>>(
+// This function is duplicated in addresses and primitives. If you make any changes, please update all three.
+pub(crate) fn new_witness_program_unchecked<T: AsRef<PushBytes>, Tg>(
     version: WitnessVersion,
     program: T,
-) -> ScriptBuf {
+) -> ScriptBuf<Tg> {
     let program = program.as_ref();
     debug_assert!(program.len() >= 2 && program.len() <= 40);
     // In SegWit v0, the program must be either 20 bytes (P2WPKH) or 32 bytes (P2WSH) long.
@@ -208,80 +207,70 @@ pub(crate) fn new_witness_program_unchecked<T: AsRef<PushBytes>>(
     Builder::new().push_opcode(version.into()).push_slice(program).into_script()
 }
 
-impl Encodable for Script {
-    #[inline]
-    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
-        crate::consensus::encode::consensus_encode_with_size(self.as_bytes(), w)
+/// Error types for Bitcoin scripts.
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
+
+    use crate::OutPoint;
+
+    #[rustfmt::skip]        // Keep public re-exports separate.
+    #[doc(inline)]
+    pub use super::push_bytes::ScriptIntError;
+    #[doc(no_inline)]
+    pub use primitives::script::error::{
+        PushBytesError, RedeemScriptError, RedeemScriptSizeError, ScriptBufDecoderError,
+        WitnessScriptSizeError,
+    };
+
+    /// Ways that a script might fail. Not everything is split up as
+    /// much as it could be; patches welcome if more detailed errors
+    /// would help you.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum Error {
+        /// Something did a non-minimal push; for more information see
+        /// <https://github.com/bitcoin/bips/blob/master/bip-0062.mediawiki#push-operators>
+        NonMinimalPush,
+        /// Some opcode expected a parameter but it was missing or truncated.
+        EarlyEndOfScript,
+        /// Tried to read an array off the stack as a number when it was more than 4 bytes.
+        NumericOverflow,
+        /// Cannot find the spent output.
+        UnknownSpentOutput(OutPoint),
+        /// Cannot serialize the spending transaction.
+        Serialization,
     }
-}
 
-impl Encodable for ScriptBuf {
-    #[inline]
-    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
-        self.as_script().consensus_encode(w)
+    impl From<Infallible> for Error {
+        fn from(never: Infallible) -> Self { match never {} }
     }
-}
 
-impl Decodable for ScriptBuf {
-    #[inline]
-    fn consensus_decode_from_finite_reader<R: BufRead + ?Sized>(
-        r: &mut R,
-    ) -> Result<Self, encode::Error> {
-        let v: Vec<u8> = Decodable::consensus_decode_from_finite_reader(r)?;
-        Ok(ScriptBuf::from_bytes(v))
-    }
-}
-
-/// Ways that a script might fail. Not everything is split up as
-/// much as it could be; patches welcome if more detailed errors
-/// would help you.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// Something did a non-minimal push; for more information see
-    /// <https://github.com/bitcoin/bips/blob/master/bip-0062.mediawiki#push-operators>
-    NonMinimalPush,
-    /// Some opcode expected a parameter but it was missing or truncated.
-    EarlyEndOfScript,
-    /// Tried to read an array off the stack as a number when it was more than 4 bytes.
-    NumericOverflow,
-    /// Can not find the spent output.
-    UnknownSpentOutput(OutPoint),
-    /// Can not serialize the spending transaction.
-    Serialization,
-}
-
-impl From<Infallible> for Error {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use Error::*;
-
-        match *self {
-            NonMinimalPush => f.write_str("non-minimal datapush"),
-            EarlyEndOfScript => f.write_str("unexpected end of script"),
-            NumericOverflow =>
-                f.write_str("numeric overflow (number on stack larger than 4 bytes)"),
-            UnknownSpentOutput(ref point) => write!(f, "unknown spent output: {}", point),
-            Serialization =>
-                f.write_str("can not serialize the spending transaction in Transaction::verify()"),
+    impl fmt::Display for Error {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                Self::NonMinimalPush => f.write_str("non-minimal datapush"),
+                Self::EarlyEndOfScript => f.write_str("unexpected end of script"),
+                Self::NumericOverflow =>
+                    f.write_str("numeric overflow (number on stack larger than 4 bytes)"),
+                Self::UnknownSpentOutput(ref point) => write!(f, "unknown spent output: {}", point),
+                Self::Serialization => f.write_str(
+                    "can not serialize the spending transaction in Transaction::verify()",
+                ),
+            }
         }
     }
-}
 
-#[cfg(feature = "std")]
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        use Error::*;
-
-        match *self {
-            NonMinimalPush
-            | EarlyEndOfScript
-            | NumericOverflow
-            | UnknownSpentOutput(_)
-            | Serialization => None,
+    #[cfg(feature = "std")]
+    impl std::error::Error for Error {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::NonMinimalPush
+                | Self::EarlyEndOfScript
+                | Self::NumericOverflow
+                | Self::UnknownSpentOutput(_)
+                | Self::Serialization => None,
+            }
         }
     }
 }

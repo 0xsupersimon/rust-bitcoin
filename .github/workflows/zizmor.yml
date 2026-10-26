@@ -1,0 +1,25 @@
+name: GitHub Actions Security Analysis with zizmor 🌈
+
+on:
+  pull_request:
+    branches: ["**"]
+    paths:
+      - '.github/**'
+
+permissions: {}
+
+jobs:
+  zizmor:
+    name: zizmor via PyPI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v5
+
+      - name: Run zizmor 🌈
+        run: uvx zizmor@1.22.0 .

@@ -13,13 +13,13 @@
 //!
 //! # Relevant BIPS
 //!
-//! * [BIP 157 - Client Side Block Filtering](https://github.com/bitcoin/bips/blob/master/bip-0157.mediawiki)
-//! * [BIP 158 - Compact Block Filters for Light Clients](https://github.com/bitcoin/bips/blob/master/bip-0158.mediawiki)
+//! * [BIP-0157 - Client Side Block Filtering](https://github.com/bitcoin/bips/blob/master/bip-0157.mediawiki)
+//! * [BIP-0158 - Compact Block Filters for Light Clients](https://github.com/bitcoin/bips/blob/master/bip-0158.mediawiki)
 //!
 //! # Examples
 //!
 //! ```ignore
-//! fn get_script_for_coin(coin: &OutPoint) -> Result<ScriptBuf, BlockFilterError> {
+//! fn get_script_for_coin(coin: &OutPoint) -> Result<ScriptPubKeyBuf, BlockFilterError> {
 //!   // get utxo ...
 //! }
 //!
@@ -31,86 +31,32 @@
 //!
 //! // read and evaluate a filter
 //!
-//! let query: Iterator<Item=ScriptBuf> = // .. some scripts you care about
+//! let query: Iterator<Item=ScriptPubKeyBuf> = // .. some scripts you care about
 //! if filter.match_any(&block_hash, &mut query.map(|s| s.as_bytes())) {
 //!   // get this block
 //! }
 //!  ```
 
 use core::cmp::{self, Ordering};
-use core::convert::Infallible;
-use core::fmt;
 
-use hashes::{sha256d, siphash24, HashEngine as _};
+use hashes::{sha256d, siphash24};
 use internals::array::ArrayExt as _;
-use internals::{write_err, ToU64 as _};
 use io::{BufRead, Write};
 
 use crate::block::{Block, BlockHash, Checked};
-use crate::consensus::{ReadExt, WriteExt};
-use crate::internal_macros::impl_hashencode;
+use crate::encoding::{CompactSizeEncoder, CompactSizeU64Decoder, ExactSizeEncoder as _};
 use crate::prelude::{BTreeSet, Borrow, Vec};
-use crate::script::{Script, ScriptExt as _};
+use crate::script::ScriptPubKey;
 use crate::transaction::OutPoint;
+use crate::ToU64 as _;
 
-/// Golomb encoding parameter as in BIP-158, see also https://gist.github.com/sipa/576d5f09c3b86c3b1b75598d799fc845
+#[rustfmt::skip]                // Keep public re-exports separate.
+#[doc(no_inline)]
+pub use self::error::Error;
+
+/// Golomb encoding parameter as in BIP-0158, see also https://gist.github.com/sipa/576d5f09c3b86c3b1b75598d799fc845
 const P: u8 = 19;
 const M: u64 = 784931;
-
-hashes::hash_newtype! {
-    /// Filter hash, as defined in BIP-157.
-    pub struct FilterHash(sha256d::Hash);
-    /// Filter header, as defined in BIP-157.
-    pub struct FilterHeader(sha256d::Hash);
-}
-
-hashes::impl_hex_for_newtype!(FilterHash, FilterHeader);
-#[cfg(feature = "serde")]
-hashes::impl_serde_for_newtype!(FilterHash, FilterHeader);
-
-impl_hashencode!(FilterHash);
-impl_hashencode!(FilterHeader);
-
-/// Errors for blockfilter.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum Error {
-    /// Missing UTXO, cannot calculate script filter.
-    UtxoMissing(OutPoint),
-    /// I/O error reading or writing binary serialization of the filter.
-    Io(io::Error),
-}
-
-impl From<Infallible> for Error {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        use Error::*;
-
-        match *self {
-            UtxoMissing(ref coin) => write!(f, "unresolved UTXO {}", coin),
-            Io(ref e) => write_err!(f, "I/O error"; e),
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        use Error::*;
-
-        match *self {
-            UtxoMissing(_) => None,
-            Io(ref e) => Some(e),
-        }
-    }
-}
-
-impl From<io::Error> for Error {
-    fn from(io: io::Error) -> Self { Error::Io(io) }
-}
 
 /// A block filter, as described by BIP 158.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,28 +65,18 @@ pub struct BlockFilter {
     pub content: Vec<u8>,
 }
 
-impl FilterHash {
-    /// Computes the filter header from a filter hash and previous filter header.
-    pub fn filter_header(&self, previous_filter_header: FilterHeader) -> FilterHeader {
-        let mut engine = sha256d::Hash::engine();
-        engine.input(self.as_ref());
-        engine.input(previous_filter_header.as_ref());
-        FilterHeader(sha256d::Hash::from_engine(engine))
-    }
-}
-
 impl BlockFilter {
     /// Constructs a new filter from pre-computed data.
-    pub fn new(content: &[u8]) -> BlockFilter { BlockFilter { content: content.to_vec() } }
+    pub fn new(content: &[u8]) -> Self { Self { content: content.to_vec() } }
 
     /// Computes a SCRIPT_FILTER that contains spent and output scripts.
     pub fn new_script_filter<M, S>(
         block: &Block<Checked>,
         script_for_coin: M,
-    ) -> Result<BlockFilter, Error>
+    ) -> Result<Self, Error>
     where
         M: Fn(&OutPoint) -> Result<S, Error>,
-        S: Borrow<Script>,
+        S: Borrow<ScriptPubKey>,
     {
         let mut out = Vec::new();
         let mut writer = BlockFilterWriter::new(&mut out, block);
@@ -149,23 +85,13 @@ impl BlockFilter {
         writer.add_input_scripts(script_for_coin)?;
         writer.finish()?;
 
-        Ok(BlockFilter { content: out })
-    }
-
-    /// Computes this filter's ID in a chain of filters (see [BIP 157]).
-    ///
-    /// [BIP 157]: <https://github.com/bitcoin/bips/blob/master/bip-0157.mediawiki#Filter_Headers>
-    pub fn filter_header(&self, previous_filter_header: FilterHeader) -> FilterHeader {
-        FilterHash(sha256d::Hash::hash(&self.content)).filter_header(previous_filter_header)
+        Ok(Self { content: out })
     }
 
     /// Computes the canonical hash for the given filter.
-    pub fn filter_hash(&self) -> FilterHash {
-        let hash = sha256d::Hash::hash(&self.content);
-        FilterHash(hash)
-    }
+    pub fn filter_hash(&self) -> sha256d::Hash { sha256d::Hash::hash(&self.content) }
 
-    /// Returns true if any query matches against this [`BlockFilter`].
+    /// Returns `true` if any query matches against this [`BlockFilter`].
     pub fn match_any<I>(&self, block_hash: BlockHash, query: I) -> Result<bool, Error>
     where
         I: Iterator,
@@ -175,7 +101,7 @@ impl BlockFilter {
         filter_reader.match_any(&mut self.content.as_slice(), query)
     }
 
-    /// Returns true if all queries match against this [`BlockFilter`].
+    /// Returns `true` if all queries match against this [`BlockFilter`].
     pub fn match_all<I>(&self, block_hash: BlockHash, query: I) -> Result<bool, Error>
     where
         I: Iterator,
@@ -194,7 +120,7 @@ pub struct BlockFilterWriter<'a, W> {
 
 impl<'a, W: Write> BlockFilterWriter<'a, W> {
     /// Constructs a new [`BlockFilterWriter`] from `block`.
-    pub fn new(writer: &'a mut W, block: &'a Block<Checked>) -> BlockFilterWriter<'a, W> {
+    pub fn new(writer: &'a mut W, block: &'a Block<Checked>) -> Self {
         let block_hash_as_int = block.block_hash().to_byte_array();
         let k0 = u64::from_le_bytes(*block_hash_as_int.sub_array::<0, 8>());
         let k1 = u64::from_le_bytes(*block_hash_as_int.sub_array::<8, 8>());
@@ -205,7 +131,7 @@ impl<'a, W: Write> BlockFilterWriter<'a, W> {
     /// Adds output scripts of the block to filter (excluding OP_RETURN scripts).
     pub fn add_output_scripts(&mut self) {
         for transaction in self.block.transactions() {
-            for output in &transaction.output {
+            for output in &transaction.outputs {
                 if !output.script_pubkey.is_op_return() {
                     self.add_element(output.script_pubkey.as_bytes());
                 }
@@ -217,20 +143,18 @@ impl<'a, W: Write> BlockFilterWriter<'a, W> {
     pub fn add_input_scripts<M, S>(&mut self, script_for_coin: M) -> Result<(), Error>
     where
         M: Fn(&OutPoint) -> Result<S, Error>,
-        S: Borrow<Script>,
+        S: Borrow<ScriptPubKey>,
     {
         for script in self
             .block
             .transactions()
             .iter()
             .skip(1) // skip coinbase
-            .flat_map(|t| t.input.iter().map(|i| &i.previous_output))
+            .flat_map(|t| t.inputs.iter().map(|i| &i.previous_output))
             .map(script_for_coin)
         {
-            match script {
-                Ok(script) => self.add_element(script.borrow().as_bytes()),
-                Err(e) => return Err(e),
-            }
+            let script = script?;
+            self.add_element(script.borrow().as_bytes());
         }
         Ok(())
     }
@@ -249,14 +173,14 @@ pub struct BlockFilterReader {
 
 impl BlockFilterReader {
     /// Constructs a new [`BlockFilterReader`] from `block_hash`.
-    pub fn new(block_hash: BlockHash) -> BlockFilterReader {
+    pub fn new(block_hash: BlockHash) -> Self {
         let block_hash_as_int = block_hash.to_byte_array();
         let k0 = u64::from_le_bytes(*block_hash_as_int.sub_array::<0, 8>());
         let k1 = u64::from_le_bytes(*block_hash_as_int.sub_array::<8, 8>());
-        BlockFilterReader { reader: GcsFilterReader::new(k0, k1, M, P) }
+        Self { reader: GcsFilterReader::new(k0, k1, M, P) }
     }
 
-    /// Returns true if any query matches against this [`BlockFilterReader`].
+    /// Returns `true` if any query matches against this [`BlockFilterReader`].
     pub fn match_any<I, R>(&self, reader: &mut R, query: I) -> Result<bool, Error>
     where
         I: Iterator,
@@ -266,7 +190,7 @@ impl BlockFilterReader {
         self.reader.match_any(reader, query)
     }
 
-    /// Returns true if all queries match against this [`BlockFilterReader`].
+    /// Returns `true` if all queries match against this [`BlockFilterReader`].
     pub fn match_all<I, R>(&self, reader: &mut R, query: I) -> Result<bool, Error>
     where
         I: Iterator,
@@ -285,18 +209,19 @@ pub struct GcsFilterReader {
 
 impl GcsFilterReader {
     /// Constructs a new [`GcsFilterReader`] with specific seed to siphash.
-    pub fn new(k0: u64, k1: u64, m: u64, p: u8) -> GcsFilterReader {
-        GcsFilterReader { filter: GcsFilter::new(k0, k1, p), m }
+    pub fn new(k0: u64, k1: u64, m: u64, p: u8) -> Self {
+        Self { filter: GcsFilter::new(k0, k1, p), m }
     }
 
-    /// Returns true if any query matches against this [`GcsFilterReader`].
+    /// Returns `true` if any query matches against this [`GcsFilterReader`].
     pub fn match_any<I, R>(&self, reader: &mut R, query: I) -> Result<bool, Error>
     where
         I: Iterator,
         I::Item: Borrow<[u8]>,
         R: BufRead + ?Sized,
     {
-        let n_elements = reader.read_compact_size().unwrap_or(0);
+        let n_elements = io::decode_from_read_with::<CompactSizeU64Decoder, _>(&mut *reader)
+            .map_err(Error::InvalidCompactSize)?;
         // map hashes to [0, n_elements << grp]
         let nm = n_elements * self.m;
         let mut mapped =
@@ -304,7 +229,7 @@ impl GcsFilterReader {
         // sort
         mapped.sort_unstable();
         if mapped.is_empty() {
-            return Ok(true);
+            return Ok(false);
         }
         if n_elements == 0 {
             return Ok(false);
@@ -332,14 +257,15 @@ impl GcsFilterReader {
         Ok(false)
     }
 
-    /// Returns true if all queries match against this [`GcsFilterReader`].
+    /// Returns `true` if all queries match against this [`GcsFilterReader`].
     pub fn match_all<I, R>(&self, reader: &mut R, query: I) -> Result<bool, Error>
     where
         I: Iterator,
         I::Item: Borrow<[u8]>,
         R: BufRead + ?Sized,
     {
-        let n_elements = reader.read_compact_size().unwrap_or(0);
+        let n_elements = io::decode_from_read_with::<CompactSizeU64Decoder, _>(&mut *reader)
+            .map_err(Error::InvalidCompactSize)?;
         // map hashes to [0, n_elements << grp]
         let nm = n_elements * self.m;
         let mut mapped =
@@ -390,7 +316,7 @@ pub struct GcsFilterWriter<'a, W> {
 
 impl<'a, W: Write> GcsFilterWriter<'a, W> {
     /// Constructs a new [`GcsFilterWriter`] wrapping a generic writer, with specific seed to siphash.
-    pub fn new(writer: &'a mut W, k0: u64, k1: u64, m: u64, p: u8) -> GcsFilterWriter<'a, W> {
+    pub fn new(writer: &'a mut W, k0: u64, k1: u64, m: u64, p: u8) -> Self {
         GcsFilterWriter { filter: GcsFilter::new(k0, k1, p), writer, elements: BTreeSet::new(), m }
     }
 
@@ -414,7 +340,9 @@ impl<'a, W: Write> GcsFilterWriter<'a, W> {
         mapped.sort_unstable();
 
         // write number of elements as varint
-        let mut wrote = self.writer.emit_compact_size(mapped.len())?;
+        let mut encoder = CompactSizeEncoder::new(mapped.len());
+        let mut wrote = encoder.len();
+        io::drain_to_writer(&mut encoder, &mut self.writer)?;
 
         // write out deltas of sorted values into a Golomb-Rice coded bit stream
         let mut writer = BitStreamWriter::new(self.writer);
@@ -437,7 +365,7 @@ struct GcsFilter {
 
 impl GcsFilter {
     /// Constructs a new [`GcsFilter`].
-    fn new(k0: u64, k1: u64, p: u8) -> GcsFilter { GcsFilter { k0, k1, p } }
+    fn new(k0: u64, k1: u64, p: u8) -> Self { Self { k0, k1, p } }
 
     /// Golomb-Rice encodes a number `n` to a bit stream (parameter 2^k).
     fn golomb_rice_encode<W>(
@@ -488,9 +416,7 @@ pub struct BitStreamReader<'a, R: ?Sized> {
 
 impl<'a, R: BufRead + ?Sized> BitStreamReader<'a, R> {
     /// Constructs a new [`BitStreamReader`] that reads bitwise from a given `reader`.
-    pub fn new(reader: &'a mut R) -> BitStreamReader<'a, R> {
-        BitStreamReader { buffer: [0u8], reader, offset: 8 }
-    }
+    pub fn new(reader: &'a mut R) -> Self { BitStreamReader { buffer: [0u8], reader, offset: 8 } }
 
     /// Reads nbit bits, returning the bits in a `u64` starting with the rightmost bit.
     ///
@@ -508,7 +434,7 @@ impl<'a, R: BufRead + ?Sized> BitStreamReader<'a, R> {
         if nbits > 64 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                "can not read more than 64 bits at once",
+                "cannot read more than 64 bits at once",
             ));
         }
         let mut data = 0u64;
@@ -519,7 +445,7 @@ impl<'a, R: BufRead + ?Sized> BitStreamReader<'a, R> {
             }
             let bits = cmp::min(8 - self.offset, nbits);
             data <<= bits;
-            data |= ((self.buffer[0] << self.offset) >> (8 - bits)) as u64;
+            data |= u64::from((self.buffer[0] << self.offset) >> (8 - bits));
             self.offset += bits;
             nbits -= bits;
         }
@@ -536,16 +462,14 @@ pub struct BitStreamWriter<'a, W> {
 
 impl<'a, W: Write> BitStreamWriter<'a, W> {
     /// Constructs a new [`BitStreamWriter`] that writes bitwise to a given `writer`.
-    pub fn new(writer: &'a mut W) -> BitStreamWriter<'a, W> {
-        BitStreamWriter { buffer: [0u8], writer, offset: 0 }
-    }
+    pub fn new(writer: &'a mut W) -> Self { BitStreamWriter { buffer: [0u8], writer, offset: 0 } }
 
     /// Writes nbits bits from data.
     pub fn write(&mut self, data: u64, mut nbits: u8) -> Result<usize, io::Error> {
         if nbits > 64 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                "can not write more than 64 bits at once",
+                "cannot write more than 64 bits at once",
             ));
         }
         let mut wrote = 0;
@@ -574,85 +498,62 @@ impl<'a, W: Write> BitStreamWriter<'a, W> {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use std::collections::HashMap;
+/// Error types for BIP-158
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
 
-    use hex_lit::hex;
-    use serde_json::Value;
+    use internals::write_err;
 
-    use super::*;
-    use crate::consensus::encode::deserialize;
-    use crate::ScriptBuf;
+    use crate::transaction::OutPoint;
 
-    #[test]
-    fn blockfilters() {
-        let hex = |b| <Vec<u8> as hex::FromHex>::from_hex(b).unwrap();
+    /// Errors for blockfilter.
+    #[derive(Debug)]
+    #[non_exhaustive]
+    pub enum Error {
+        /// Missing UTXO, cannot calculate script filter.
+        UtxoMissing(OutPoint),
+        /// Invalid CompactSize encoded element count in the filter.
+        InvalidCompactSize(io::ReadError<encoding::CompactSizeDecoderError>),
+        /// I/O error reading or writing binary serialization of the filter.
+        Io(io::Error),
+    }
 
-        // test vectors from: https://github.com/jimpo/bitcoin/blob/c7efb652f3543b001b4dd22186a354605b14f47e/src/test/data/blockfilters.json
-        let data = include_str!("../tests/data/blockfilters.json");
+    impl From<Infallible> for Error {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
 
-        let testdata = serde_json::from_str::<Value>(data).unwrap().as_array().unwrap().clone();
-        for t in testdata.iter().skip(1) {
-            let block_hash = t.get(1).unwrap().as_str().unwrap().parse::<BlockHash>().unwrap();
-            let block: Block = deserialize(&hex(t.get(2).unwrap().as_str().unwrap())).unwrap();
-            let block = block.assume_checked(None);
-            assert_eq!(block.block_hash(), block_hash);
-            let scripts = t.get(3).unwrap().as_array().unwrap();
-            let previous_filter_header =
-                t.get(4).unwrap().as_str().unwrap().parse::<FilterHeader>().unwrap();
-            let filter_content = hex(t.get(5).unwrap().as_str().unwrap());
-            let filter_header =
-                t.get(6).unwrap().as_str().unwrap().parse::<FilterHeader>().unwrap();
-
-            let mut txmap = HashMap::new();
-            let mut si = scripts.iter();
-            for tx in block.transactions().iter().skip(1) {
-                for input in tx.input.iter() {
-                    txmap.insert(
-                        input.previous_output,
-                        ScriptBuf::from(hex(si.next().unwrap().as_str().unwrap())),
-                    );
-                }
+    impl fmt::Display for Error {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                Self::UtxoMissing(ref coin) => write!(f, "unresolved UTXO {}", coin),
+                Self::InvalidCompactSize(ref e) => write_err!(f, "invalid CompactSize"; e),
+                Self::Io(ref e) => write_err!(f, "I/O error"; e),
             }
-
-            let filter = BlockFilter::new_script_filter(&block, |o| {
-                if let Some(s) = txmap.get(o) {
-                    Ok(s.clone())
-                } else {
-                    Err(Error::UtxoMissing(*o))
-                }
-            })
-            .unwrap();
-
-            let test_filter = BlockFilter::new(filter_content.as_slice());
-
-            assert_eq!(test_filter.content, filter.content);
-
-            let block_hash = &block.block_hash();
-            assert!(filter
-                .match_all(
-                    *block_hash,
-                    &mut txmap.iter().filter_map(|(_, s)| if !s.is_empty() {
-                        Some(s.as_bytes())
-                    } else {
-                        None
-                    })
-                )
-                .unwrap());
-
-            for script in txmap.values() {
-                let query = [script];
-                if !script.is_empty() {
-                    assert!(filter
-                        .match_any(*block_hash, &mut query.iter().map(|s| s.as_bytes()))
-                        .unwrap());
-                }
-            }
-
-            assert_eq!(filter_header, filter.filter_header(previous_filter_header));
         }
     }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for Error {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::UtxoMissing(_) => None,
+                Self::InvalidCompactSize(ref e) => Some(e),
+                Self::Io(ref e) => Some(e),
+            }
+        }
+    }
+
+    impl From<io::Error> for Error {
+        fn from(io: io::Error) -> Self { Self::Io(io) }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use hex::hex;
+
+    use super::*;
 
     #[test]
     fn filter() {
@@ -716,11 +617,45 @@ mod test {
             for p in &patterns {
                 query.push(p);
             }
-            query.push(&hex!("abcdef"));
+            let extra = hex!("abcdef");
+            query.push(&extra);
             assert!(!reader
                 .match_all(&mut bytes.as_slice(), &mut query.iter().map(|v| v.as_slice()))
                 .unwrap());
         }
+    }
+
+    #[test]
+    fn malformed_filter_count_errors() {
+        // Check the inner private error type via text
+        fn assert_error_string(result: Result<bool, Error>, substring: &str) {
+            match result {
+                Err(Error::InvalidCompactSize(io::ReadError::Decode(c_err))) => {
+                    let err_msg = format!("{}", c_err);
+                    assert!(err_msg.contains(substring));
+                }
+                _ => panic!("Incorrect error type: {:?}", result),
+            }
+        }
+
+        let query = [hex!("000000")];
+        let reader = GcsFilterReader::new(0, 0, M, P);
+
+        let mut bytes = &[0xfd][..];
+        let result = reader.match_any(&mut bytes, query.iter().map(|v| v.as_slice()));
+        assert_error_string(result, "required at least");
+
+        let mut bytes = &[0xfd][..];
+        let result = reader.match_all(&mut bytes, query.iter().map(|v| v.as_slice()));
+        assert_error_string(result, "required at least");
+
+        let mut bytes = &[0xfd, 0xfc, 0x00][..];
+        let result = reader.match_any(&mut bytes, query.iter().map(|v| v.as_slice()));
+        assert_error_string(result, "not encoded minimally");
+
+        let mut bytes = &[0xfd, 0xfc, 0x00][..];
+        let result = reader.match_all(&mut bytes, query.iter().map(|v| v.as_slice()));
+        assert_error_string(result, "not encoded minimally");
     }
 
     #[test]

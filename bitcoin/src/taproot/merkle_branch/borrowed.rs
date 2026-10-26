@@ -1,4 +1,5 @@
 use core::borrow::{Borrow, BorrowMut};
+use core::slice;
 
 use internals::slice::SliceExt;
 pub use privacy_boundary::TaprootMerkleBranch;
@@ -12,7 +13,8 @@ use super::{
 mod privacy_boundary {
     use super::*;
 
-    internals::transparent_newtype! {
+    // Defined in `REPO_DIR/include/newtype.rs`.
+    transparent_newtype! {
         /// The Merkle proof for inclusion of a tree in a Taproot tree hash.
         #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct TaprootMerkleBranch([TapNodeHash]);
@@ -46,11 +48,11 @@ impl TaprootMerkleBranch {
     #[inline]
     pub fn is_empty(&self) -> bool { self.as_slice().is_empty() }
 
-    /// Creates an iterator over the node hashes.
+    /// Constructs an iterator over the node hashes.
     #[inline]
     pub fn iter(&self) -> core::slice::Iter<'_, TapNodeHash> { self.into_iter() }
 
-    /// Creates an iterator over the mutable node hashes.
+    /// Constructs an iterator over the mutable node hashes.
     #[inline]
     pub fn iter_mut(&mut self) -> core::slice::IterMut<'_, TapNodeHash> { self.into_iter() }
 
@@ -67,9 +69,7 @@ impl TaprootMerkleBranch {
 
     /// Serializes to a writer.
     ///
-    /// # Returns
-    ///
-    /// The number of bytes written to the writer.
+    /// Returns the number of bytes written to the writer.
     pub fn encode<Write: io::Write + ?Sized>(&self, writer: &mut Write) -> io::Result<usize> {
         let bytes = self.as_bytes();
         writer.write_all(bytes)?;
@@ -95,11 +95,11 @@ impl TaprootMerkleBranch {
     fn decode_exact(
         nodes: &[[u8; TAPROOT_CONTROL_NODE_SIZE]],
     ) -> Result<&Self, InvalidMerkleTreeDepthError> {
-        // SAFETY:
-        // The lifetime of the returned reference is the same as the lifetime of the input
-        // reference, the size of `TapNodeHash` is equal to `TAPROOT_CONTROL_NODE_SIZE` and the
-        // alignment of `TapNodeHash` is equal to the alignment of `u8` (see tests below).
-        Self::from_hashes(unsafe { &*(nodes as *const _ as *const [TapNodeHash]) })
+        // SAFETY: `TapNodeHash` is `#[repr(transparent)]` and contains a (type which is
+        // `#[repr(transparent)]` and contains a) `[u8; 32]`.
+        Self::from_hashes(unsafe {
+            slice::from_raw_parts(nodes.as_ptr().cast::<TapNodeHash>(), nodes.len())
+        })
     }
 
     fn from_hashes(nodes: &[TapNodeHash]) -> Result<&Self, InvalidMerkleTreeDepthError> {
@@ -115,12 +115,12 @@ impl Default for &'_ TaprootMerkleBranch {
     fn default() -> Self { TaprootMerkleBranch::new() }
 }
 
-impl AsRef<TaprootMerkleBranch> for TaprootMerkleBranch {
-    fn as_ref(&self) -> &TaprootMerkleBranch { self }
+impl AsRef<Self> for TaprootMerkleBranch {
+    fn as_ref(&self) -> &Self { self }
 }
 
-impl AsMut<TaprootMerkleBranch> for TaprootMerkleBranch {
-    fn as_mut(&mut self) -> &mut TaprootMerkleBranch { self }
+impl AsMut<Self> for TaprootMerkleBranch {
+    fn as_mut(&mut self) -> &mut Self { self }
 }
 
 impl AsRef<TaprootMerkleBranch> for TaprootMerkleBranchBuf {

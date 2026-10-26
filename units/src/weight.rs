@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Implements `Weight` and associated features.
+//! Implements [`Weight`] and associated features.
 
 use core::num::NonZeroU64;
 use core::{fmt, ops};
@@ -10,7 +10,8 @@ use arbitrary::{Arbitrary, Unstructured};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{Amount, CheckedSum, FeeRate, NumOpResult};
+use crate::parse_int::{self, PrefixedHexError, UnprefixedHexError};
+use crate::{Amount, FeeRate, NumOpResult};
 
 /// The factor that non-witness serialization data is multiplied by during weight calculation.
 pub const WITNESS_SCALE_FACTOR: usize = 4;
@@ -25,11 +26,13 @@ mod encapsulate {
 
     impl Weight {
         /// Constructs a new [`Weight`] from weight units.
-        pub const fn from_wu(wu: u64) -> Self { Weight(wu) }
+        #[inline]
+        pub const fn from_wu(wu: u64) -> Self { Self(wu) }
 
         /// Returns raw weight units.
         ///
         /// Can be used instead of `into()` to avoid inference issues.
+        #[inline]
         pub const fn to_wu(self) -> u64 { self.0 }
     }
 }
@@ -39,128 +42,169 @@ pub use encapsulate::Weight;
 impl Weight {
     /// Zero weight units (wu).
     ///
-    /// Equivalent to [`MIN`](Self::MIN), may better express intent in some contexts.
-    pub const ZERO: Weight = Weight::from_wu(0);
+    /// Equivalent to [`MIN`], may better express intent in some contexts.
+    ///
+    /// [`MIN`]: Self::MIN
+    pub const ZERO: Self = Self::from_wu(0);
 
     /// Minimum possible value (0 wu).
     ///
-    /// Equivalent to [`ZERO`](Self::ZERO), may better express intent in some contexts.
-    pub const MIN: Weight = Weight::from_wu(u64::MIN);
+    /// Equivalent to [`ZERO`], may better express intent in some contexts.
+    ///
+    /// [`ZERO`]: Self::ZERO
+    pub const MIN: Self = Self::from_wu(u64::MIN);
 
     /// Maximum possible value.
-    pub const MAX: Weight = Weight::from_wu(u64::MAX);
+    pub const MAX: Self = Self::from_wu(u64::MAX);
 
     /// The factor that non-witness serialization data is multiplied by during weight calculation.
-    pub const WITNESS_SCALE_FACTOR: u64 = WITNESS_SCALE_FACTOR as u64;
+    pub const WITNESS_SCALE_FACTOR: u64 = WITNESS_SCALE_FACTOR as u64; // this value is 4
 
-    /// The maximum allowed weight for a block, see BIP 141 (network rule).
-    pub const MAX_BLOCK: Weight = Weight::from_wu(4_000_000);
+    /// The maximum allowed weight for a block, see BIP-0141 (network rule).
+    pub const MAX_BLOCK: Self = Self::from_wu(4_000_000);
 
     /// The minimum transaction weight for a valid serialized transaction.
-    pub const MIN_TRANSACTION: Weight = Weight::from_wu(Self::WITNESS_SCALE_FACTOR * 60);
+    pub const MIN_TRANSACTION: Self = Self::from_wu(Self::WITNESS_SCALE_FACTOR * 60);
 
     /// Constructs a new [`Weight`] from kilo weight units returning [`None`] if an overflow occurred.
+    #[inline]
     pub const fn from_kwu(wu: u64) -> Option<Self> {
-        // No `map()` in const context.
-        match wu.checked_mul(1000) {
-            Some(wu) => Some(Weight::from_wu(wu)),
-            None => None,
-        }
+        let Some(wu) = wu.checked_mul(1000) else { return None };
+        Some(Self::from_wu(wu))
     }
 
     /// Constructs a new [`Weight`] from virtual bytes, returning [`None`] if an overflow occurred.
+    #[inline]
     pub const fn from_vb(vb: u64) -> Option<Self> {
-        // No `map()` in const context.
-        match vb.checked_mul(Self::WITNESS_SCALE_FACTOR) {
-            Some(wu) => Some(Weight::from_wu(wu)),
-            None => None,
-        }
-    }
-
-    /// Constructs a new [`Weight`] from virtual bytes panicking if an overflow occurred.
-    ///
-    /// # Panics
-    ///
-    /// If the conversion from virtual bytes overflows.
-    #[deprecated(since = "TBD", note = "use `from_vb_unchecked` instead")]
-    pub const fn from_vb_unwrap(vb: u64) -> Weight {
-        match vb.checked_mul(Self::WITNESS_SCALE_FACTOR) {
-            Some(weight) => Weight::from_wu(weight),
-            None => panic!("checked_mul overflowed"),
-        }
+        let Some(wu) = vb.checked_mul(Self::WITNESS_SCALE_FACTOR) else { return None };
+        Some(Self::from_wu(wu))
     }
 
     /// Constructs a new [`Weight`] from virtual bytes without an overflow check.
-    pub const fn from_vb_unchecked(vb: u64) -> Self { Weight::from_wu(vb * 4) }
+    #[inline]
+    pub const fn from_vb_unchecked(vb: u64) -> Self {
+        Self::from_wu(vb * Self::WITNESS_SCALE_FACTOR)
+    }
 
-    /// Constructs a new [`Weight`] from witness size.
-    pub const fn from_witness_data_size(witness_size: u64) -> Self { Weight::from_wu(witness_size) }
+    /// Constructs a new [`Weight`] from a prefixed hex string.
+    ///
+    /// The hex string once parsed is assumed to represent weight units.
+    ///
+    /// # Errors
+    ///
+    /// If the input string is not a valid hex representation of a weight in weight units or it
+    /// does not include the `0x` prefix.
+    #[inline]
+    pub fn from_hex(s: &str) -> Result<Self, PrefixedHexError> {
+        let weight = parse_int::hex_u64_prefixed(s)?;
+        Ok(Self::from_wu(weight))
+    }
 
-    /// Constructs a new [`Weight`] from non-witness size.
-    pub const fn from_non_witness_data_size(non_witness_size: u64) -> Self {
-        Weight::from_wu(non_witness_size * Self::WITNESS_SCALE_FACTOR)
+    /// Constructs a new [`Weight`] from an unprefixed hex string.
+    ///
+    /// The hex string once parsed is assumed to represent weight units.
+    ///
+    /// # Errors
+    ///
+    /// If the input string is not a valid hex representation of a weight in weight units or if
+    /// it includes the `0x` prefix.
+    #[inline]
+    pub fn from_unprefixed_hex(s: &str) -> Result<Self, UnprefixedHexError> {
+        let weight = parse_int::hex_u64_unprefixed(s)?;
+        Ok(Self::from_wu(weight))
     }
 
     /// Converts to kilo weight units rounding down.
+    #[inline]
     pub const fn to_kwu_floor(self) -> u64 { self.to_wu() / 1000 }
 
     /// Converts to kilo weight units rounding up.
-    pub const fn to_kwu_ceil(self) -> u64 { (self.to_wu() + 999) / 1000 }
+    #[inline]
+    pub const fn to_kwu_ceil(self) -> u64 { self.to_wu().div_ceil(1_000) }
 
     /// Converts to vB rounding down.
+    #[inline]
+    pub const fn to_vb_floor(self) -> u64 { self.to_wu() / Self::WITNESS_SCALE_FACTOR }
+
+    /// Converts to vB rounding down.
+    #[inline]
+    #[deprecated(since = "0.6.0", note = "use `to_vb_floor()` instead")]
     pub const fn to_vbytes_floor(self) -> u64 { self.to_wu() / Self::WITNESS_SCALE_FACTOR }
 
     /// Converts to vB rounding up.
-    pub const fn to_vbytes_ceil(self) -> u64 {
-        (self.to_wu() + Self::WITNESS_SCALE_FACTOR - 1) / Self::WITNESS_SCALE_FACTOR
-    }
+    #[inline]
+    pub const fn to_vb_ceil(self) -> u64 { self.to_wu().div_ceil(Self::WITNESS_SCALE_FACTOR) }
+
+    /// Converts to vB rounding up.
+    #[inline]
+    #[deprecated(since = "0.6.0", note = "use `to_vb_ceil()` instead")]
+    pub const fn to_vbytes_ceil(self) -> u64 { self.to_wu().div_ceil(Self::WITNESS_SCALE_FACTOR) }
 
     /// Checked addition.
     ///
     /// Computes `self + rhs` returning [`None`] if an overflow occurred.
+    #[inline]
     #[must_use]
     pub const fn checked_add(self, rhs: Self) -> Option<Self> {
-        // No `map()` in const context.
-        match self.to_wu().checked_add(rhs.to_wu()) {
-            Some(wu) => Some(Weight::from_wu(wu)),
-            None => None,
-        }
+        let Some(wu) = self.to_wu().checked_add(rhs.to_wu()) else { return None };
+        Some(Self::from_wu(wu))
     }
 
     /// Checked subtraction.
     ///
     /// Computes `self - rhs` returning [`None`] if an overflow occurred.
+    #[inline]
     #[must_use]
     pub const fn checked_sub(self, rhs: Self) -> Option<Self> {
-        // No `map()` in const context.
-        match self.to_wu().checked_sub(rhs.to_wu()) {
-            Some(wu) => Some(Weight::from_wu(wu)),
-            None => None,
-        }
+        let Some(wu) = self.to_wu().checked_sub(rhs.to_wu()) else { return None };
+        Some(Self::from_wu(wu))
     }
 
     /// Checked multiplication.
     ///
     /// Computes `self * rhs` returning [`None`] if an overflow occurred.
+    #[inline]
     #[must_use]
     pub const fn checked_mul(self, rhs: u64) -> Option<Self> {
-        // No `map()` in const context.
-        match self.to_wu().checked_mul(rhs) {
-            Some(wu) => Some(Weight::from_wu(wu)),
-            None => None,
-        }
+        let Some(wu) = self.to_wu().checked_mul(rhs) else { return None };
+        Some(Self::from_wu(wu))
     }
 
     /// Checked division.
     ///
     /// Computes `self / rhs` returning [`None`] if `rhs == 0`.
+    #[inline]
     #[must_use]
     pub const fn checked_div(self, rhs: u64) -> Option<Self> {
-        // No `map()` in const context.
-        match self.to_wu().checked_div(rhs) {
-            Some(wu) => Some(Weight::from_wu(wu)),
-            None => None,
-        }
+        let Some(wu) = self.to_wu().checked_div(rhs) else { return None };
+        Some(Self::from_wu(wu))
+    }
+
+    /// Saturating addition.
+    ///
+    /// Computes `self + rhs`, saturating at [`Weight::MAX`] instead of overflowing.
+    #[inline]
+    #[must_use]
+    pub const fn saturating_add(self, rhs: Self) -> Self {
+        Self::from_wu(self.to_wu().saturating_add(rhs.to_wu()))
+    }
+
+    /// Saturating subtraction.
+    ///
+    /// Computes `self - rhs`, saturating at [`Weight::MIN`] instead of overflowing.
+    #[inline]
+    #[must_use]
+    pub const fn saturating_sub(self, rhs: Self) -> Self {
+        Self::from_wu(self.to_wu().saturating_sub(rhs.to_wu()))
+    }
+
+    /// Saturating multiplication.
+    ///
+    /// Computes `self * rhs`, saturating at [`Weight::MAX`] instead of overflowing.
+    #[inline]
+    #[must_use]
+    pub const fn saturating_mul(self, rhs: u64) -> Self {
+        Self::from_wu(self.to_wu().saturating_mul(rhs))
     }
 
     /// Checked fee rate multiplication.
@@ -168,13 +212,17 @@ impl Weight {
     /// Computes the absolute fee amount for a given [`FeeRate`] at this weight. When the resulting
     /// fee is a non-integer amount, the amount is rounded up, ensuring that the transaction fee is
     /// enough instead of falling short if rounded down.
+    #[inline]
     pub const fn mul_by_fee_rate(self, fee_rate: FeeRate) -> NumOpResult<Amount> {
         fee_rate.mul_by_weight(self)
     }
 }
 
+crate::internal_macros::impl_fmt_traits_for_u32_wrapper!(Weight, to_wu);
+
 /// Alternative will display the unit.
 impl fmt::Display for Weight {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if f.alternate() {
             write!(f, "{} wu", self.to_wu())
@@ -185,6 +233,7 @@ impl fmt::Display for Weight {
 }
 
 impl From<Weight> for u64 {
+    #[inline]
     fn from(value: Weight) -> Self { value.to_wu() }
 }
 
@@ -192,91 +241,100 @@ crate::internal_macros::impl_op_for_references! {
     impl ops::Add<Weight> for Weight {
         type Output = Weight;
 
+        #[track_caller]
         fn add(self, rhs: Weight) -> Self::Output { Weight::from_wu(self.to_wu() + rhs.to_wu()) }
     }
     impl ops::Sub<Weight> for Weight {
         type Output = Weight;
 
+        #[track_caller]
         fn sub(self, rhs: Weight) -> Self::Output { Weight::from_wu(self.to_wu() - rhs.to_wu()) }
     }
 
     impl ops::Mul<u64> for Weight {
         type Output = Weight;
 
+        #[track_caller]
         fn mul(self, rhs: u64) -> Self::Output { Weight::from_wu(self.to_wu() * rhs) }
     }
     impl ops::Mul<Weight> for u64 {
         type Output = Weight;
 
+        #[track_caller]
         fn mul(self, rhs: Weight) -> Self::Output { Weight::from_wu(self * rhs.to_wu()) }
     }
     impl ops::Div<u64> for Weight {
         type Output = Weight;
 
+        #[track_caller]
         fn div(self, rhs: u64) -> Self::Output { Weight::from_wu(self.to_wu() / rhs) }
     }
     impl ops::Div<Weight> for Weight {
         type Output = u64;
 
+        #[track_caller]
         fn div(self, rhs: Weight) -> Self::Output { self.to_wu() / rhs.to_wu() }
     }
     impl ops::Rem<u64> for Weight {
         type Output = Weight;
 
+        #[track_caller]
         fn rem(self, rhs: u64) -> Self::Output { Weight::from_wu(self.to_wu() % rhs) }
     }
     impl ops::Rem<Weight> for Weight {
-        type Output = u64;
+        type Output = Weight;
 
-        fn rem(self, rhs: Weight) -> Self::Output { self.to_wu() % rhs.to_wu() }
+        #[track_caller]
+        fn rem(self, rhs: Weight) -> Self::Output { Weight::from_wu(self.to_wu() % rhs.to_wu()) }
     }
     impl ops::Div<NonZeroU64> for Weight {
         type Output = Weight;
 
-        fn div(self, rhs: NonZeroU64) -> Self::Output{ Self::from_wu(self.to_wu() / rhs.get()) }
+        fn div(self, rhs: NonZeroU64) -> Self::Output{ Self::from_wu(self.to_wu() / rhs) }
     }
 }
 crate::internal_macros::impl_add_assign!(Weight);
 crate::internal_macros::impl_sub_assign!(Weight);
 
 impl ops::MulAssign<u64> for Weight {
-    fn mul_assign(&mut self, rhs: u64) { *self = Weight::from_wu(self.to_wu() * rhs); }
+    #[inline]
+    #[track_caller]
+    fn mul_assign(&mut self, rhs: u64) { *self = Self::from_wu(self.to_wu() * rhs); }
 }
 
 impl ops::DivAssign<u64> for Weight {
-    fn div_assign(&mut self, rhs: u64) { *self = Weight::from_wu(self.to_wu() / rhs); }
+    #[inline]
+    #[track_caller]
+    fn div_assign(&mut self, rhs: u64) { *self = Self::from_wu(self.to_wu() / rhs); }
 }
 
 impl ops::RemAssign<u64> for Weight {
-    fn rem_assign(&mut self, rhs: u64) { *self = Weight::from_wu(self.to_wu() % rhs); }
-}
-
-impl<T> CheckedSum<Weight> for T
-where
-    T: Iterator<Item = Weight>,
-{
-    fn checked_sum(mut self) -> Option<Weight> { self.try_fold(Weight::ZERO, Weight::checked_add) }
+    #[inline]
+    #[track_caller]
+    fn rem_assign(&mut self, rhs: u64) { *self = Self::from_wu(self.to_wu() % rhs); }
 }
 
 impl core::iter::Sum for Weight {
+    #[inline]
     fn sum<I>(iter: I) -> Self
     where
         I: Iterator<Item = Self>,
     {
-        Weight::from_wu(iter.map(Weight::to_wu).sum())
+        Self::from_wu(iter.map(Self::to_wu).sum())
     }
 }
 
-impl<'a> core::iter::Sum<&'a Weight> for Weight {
+impl<'a> core::iter::Sum<&'a Self> for Weight {
+    #[inline]
     fn sum<I>(iter: I) -> Self
     where
-        I: Iterator<Item = &'a Weight>,
+        I: Iterator<Item = &'a Self>,
     {
         iter.copied().sum()
     }
 }
 
-crate::impl_parse_str_from_int_infallible!(Weight, u64, from_wu);
+parse_int::impl_parse_str_from_int_infallible!(Weight, u64, from_wu);
 
 #[cfg(feature = "serde")]
 impl Serialize for Weight {
@@ -302,9 +360,10 @@ impl<'de> Deserialize<'de> for Weight {
 
 #[cfg(feature = "arbitrary")]
 impl<'a> Arbitrary<'a> for Weight {
+    #[inline]
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
         let w = u64::arbitrary(u)?;
-        Ok(Weight::from_wu(w))
+        Ok(Self::from_wu(w))
     }
 }
 
@@ -369,19 +428,33 @@ mod tests {
     fn from_vb_unchecked_panic() { Weight::from_vb_unchecked(u64::MAX); }
 
     #[test]
-    fn from_witness_data_size() {
-        let witness_data_size = 1;
-        let got = Weight::from_witness_data_size(witness_data_size);
-        let want = Weight::from_wu(witness_data_size);
+    #[cfg(feature = "alloc")]
+    fn try_from_string() {
+        let weight_value: alloc::string::String = "10".into();
+        let got = Weight::try_from(weight_value).unwrap();
+        let want = Weight::from_wu(10);
         assert_eq!(got, want);
+
+        // Only base-10 integers should parse
+        let weight_value: alloc::string::String = "0xab".into();
+        assert!(Weight::try_from(weight_value).is_err());
+        let weight_value: alloc::string::String = "10.123".into();
+        assert!(Weight::try_from(weight_value).is_err());
     }
 
     #[test]
-    fn from_non_witness_data_size() {
-        let non_witness_data_size = 1;
-        let got = Weight::from_non_witness_data_size(non_witness_data_size);
-        let want = Weight::from_wu(non_witness_data_size * 4);
+    #[cfg(feature = "alloc")]
+    fn try_from_box() {
+        let weight_value: alloc::boxed::Box<str> = "10".into();
+        let got = Weight::try_from(weight_value).unwrap();
+        let want = Weight::from_wu(10);
         assert_eq!(got, want);
+
+        // Only base-10 integers should parse
+        let weight_value: alloc::boxed::Box<str> = "0xab".into();
+        assert!(Weight::try_from(weight_value).is_err());
+        let weight_value: alloc::boxed::Box<str> = "10.123".into();
+        assert!(Weight::try_from(weight_value).is_err());
     }
 
     #[test]
@@ -394,18 +467,20 @@ mod tests {
     fn to_kwu_ceil() {
         assert_eq!(Weight::from_wu(1_000).to_kwu_ceil(), 1);
         assert_eq!(Weight::from_wu(1_001).to_kwu_ceil(), 2);
+        assert_eq!(Weight::MAX.to_kwu_ceil(), u64::MAX / 1_000 + 1);
     }
 
     #[test]
     fn to_vb_floor() {
-        assert_eq!(Weight::from_wu(8).to_vbytes_floor(), 2);
-        assert_eq!(Weight::from_wu(9).to_vbytes_floor(), 2);
+        assert_eq!(Weight::from_wu(8).to_vb_floor(), 2);
+        assert_eq!(Weight::from_wu(9).to_vb_floor(), 2);
     }
 
     #[test]
     fn to_vb_ceil() {
-        assert_eq!(Weight::from_wu(4).to_vbytes_ceil(), 1);
-        assert_eq!(Weight::from_wu(5).to_vbytes_ceil(), 2);
+        assert_eq!(Weight::from_wu(4).to_vb_ceil(), 1);
+        assert_eq!(Weight::from_wu(5).to_vb_ceil(), 2);
+        assert_eq!(Weight::MAX.to_vb_ceil(), u64::MAX / Weight::WITNESS_SCALE_FACTOR + 1);
     }
 
     #[test]
@@ -441,6 +516,28 @@ mod tests {
 
     #[test]
     fn checked_div_overflows() { assert!(TWO.checked_div(0).is_none()) }
+
+    #[test]
+    fn saturating_add() {
+        assert_eq!(ONE.saturating_add(ONE), TWO);
+        assert_eq!(Weight::ZERO.saturating_add(Weight::ZERO), Weight::ZERO);
+        assert_eq!(Weight::MAX.saturating_add(ONE), Weight::MAX);
+    }
+
+    #[test]
+    fn saturating_sub() {
+        assert_eq!(TWO.saturating_sub(ONE), ONE);
+        assert_eq!(Weight::ZERO.saturating_sub(ONE), Weight::ZERO);
+        assert_eq!(ONE.saturating_sub(TWO), Weight::ZERO);
+    }
+
+    #[test]
+    fn saturating_mul() {
+        assert_eq!(TWO.saturating_mul(2), FOUR);
+        assert_eq!(TWO.saturating_mul(0), Weight::ZERO);
+        assert_eq!(Weight::MAX.saturating_mul(2), Weight::MAX);
+        assert_eq!(TWO.saturating_mul(u64::MAX), Weight::MAX);
+    }
 
     #[test]
     #[allow(clippy::op_ref)]
@@ -529,7 +626,7 @@ mod tests {
         let weight3 = Weight::from_wu(3);
 
         let remainder = weight10 % weight3;
-        assert_eq!(remainder, 1);
+        assert_eq!(remainder, Weight::from_wu(1));
 
         let remainder = weight10 % 3;
         assert_eq!(remainder, Weight::from_wu(1));
@@ -543,14 +640,48 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "alloc")]
-    fn checked_sum_weights() {
-        assert_eq!([].into_iter().checked_sum(), Some(Weight::ZERO));
+    fn weight_algebra() {
+        let a = Weight::from_wu(700);
+        let b = Weight::from_wu(300);
+        let d = a / b;
+        let r = a % b;
 
-        let sum = alloc::vec![0, 1, 2].iter().map(|&w| Weight::from_wu(w)).checked_sum().unwrap();
-        assert_eq!(sum, Weight::from_wu(3));
+        assert_eq!(a, d * b + r);
+    }
 
-        let sum = alloc::vec![1, u64::MAX].iter().map(|&w| Weight::from_wu(w)).checked_sum();
-        assert!(sum.is_none());
+    #[test]
+    fn iter_sum() {
+        let values = [
+            Weight::from_wu(10),
+            Weight::from_wu(50),
+            Weight::from_wu(30),
+            Weight::from_wu(5),
+            Weight::from_wu(5),
+        ];
+        let got: Weight = values.into_iter().sum();
+        let want = Weight::from_wu(100);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn iter_sum_ref() {
+        let values = [
+            Weight::from_wu(10),
+            Weight::from_wu(50),
+            Weight::from_wu(30),
+            Weight::from_wu(5),
+            Weight::from_wu(5),
+        ];
+        let got: Weight = values.iter().sum();
+        let want = Weight::from_wu(100);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn iter_sum_empty() {
+        let values: [Weight; 0] = [];
+        let got: Weight = values.into_iter().sum();
+        let want = Weight::from_wu(0);
+        assert_eq!(got, want);
     }
 }

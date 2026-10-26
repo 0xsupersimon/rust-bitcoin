@@ -2,8 +2,7 @@
 
 //! HMAC-based Extract-and-Expand Key Derivation Function (HKDF).
 //!
-//! Implementation based on RFC5869, but the interface is scoped
-//! to BIP324's requirements.
+//! Implementation based on RFC5869, but the interface is scoped to BIP-0324's requirements.
 
 #[cfg(feature = "alloc")]
 use alloc::vec;
@@ -11,38 +10,46 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::{HashEngine, Hmac, HmacEngine, IsByteArray};
+use crate::{Hash, HashEngine, Hmac, HmacEngine};
+
+#[rustfmt::skip]                // Keep public re-exports separate.
+#[doc(no_inline)]
+pub use self::error::MaxLengthError;
 
 /// Output keying material max length multiple.
 const MAX_OUTPUT_BLOCKS: usize = 255;
 
-/// Size of output exceeds maximum length allowed.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct MaxLengthError {
-    max: usize,
-}
-
-impl fmt::Display for MaxLengthError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "exceeds {} byte max output material limit", self.max)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for MaxLengthError {}
-
 /// HMAC-based Extract-and-Expand Key Derivation Function (HKDF).
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub struct Hkdf<T: HashEngine> {
     /// Pseudorandom key based on the extract step.
     prk: Hmac<T::Hash>,
+}
+
+impl<T: HashEngine> Drop for Hkdf<T> {
+    fn drop(&mut self) { self.non_secure_erase(); }
+}
+
+impl<T: HashEngine> Hkdf<T> {
+    /// Attempts to erase the contents of the pseudorandom key.
+    ///
+    /// Note, however, that the compiler is allowed to freely copy or move the
+    /// contents of this type to other places in memory. Preventing this behavior
+    /// is very subtle. For more discussion on this, please see the documentation
+    /// of the [`zeroize`](https://docs.rs/zeroize) crate.
+    #[inline]
+    pub fn non_secure_erase(&mut self) { crate::non_secure_erase(&mut self.prk); }
 }
 
 impl<T: HashEngine> Hkdf<T>
 where
     T: Default,
 {
-    /// Initialize a HKDF by performing the extract step.
+    /// Initializes a HKDF by performing the extract step.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `T::BLOCK_SIZE` exceeds 128 bytes.
     pub fn new(salt: &[u8], ikm: &[u8]) -> Self {
         let mut engine: HmacEngine<T> = HmacEngine::new(salt);
         engine.input(ikm);
@@ -53,42 +60,41 @@ where
     ///
     /// Expand may be called multiple times to derive multiple keys,
     /// but the info must be independent from the ikm for security.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaxLengthError`] if the requested output length exceeds the maximum allowed
+    /// (255 * hash output length).
     pub fn expand(&self, info: &[u8], okm: &mut [u8]) -> Result<(), MaxLengthError> {
         // Length of output keying material in bytes must be less than 255 * hash length.
-        if okm.len() > (MAX_OUTPUT_BLOCKS * T::Bytes::LEN) {
-            return Err(MaxLengthError { max: MAX_OUTPUT_BLOCKS * T::Bytes::LEN });
+        if okm.len() > (MAX_OUTPUT_BLOCKS * T::Hash::LEN) {
+            return Err(MaxLengthError { max: MAX_OUTPUT_BLOCKS * T::Hash::LEN });
         }
 
-        // Counter starts at "1" based on RFC5869 spec and is committed to in the hash.
-        let mut counter = 1u8;
         // Ceiling calculation for the total number of blocks (iterations) required for the expand.
-        let total_blocks = (okm.len() + T::Bytes::LEN - 1) / T::Bytes::LEN;
+        let total_blocks = okm.len().div_ceil(T::Hash::LEN);
 
-        while counter <= total_blocks as u8 {
+        // Counter starts at "1" based on RFC5869 spec and is committed to in the hash.
+        for counter in 1..=total_blocks {
             let mut engine: HmacEngine<T> = HmacEngine::new(self.prk.as_ref());
 
             // First block does not have a previous block,
             // all other blocks include last block in the HMAC input.
-            if counter != 1u8 {
-                let previous_start_index = (counter as usize - 2) * T::Bytes::LEN;
-                let previous_end_index = (counter as usize - 1) * T::Bytes::LEN;
+            if counter != 1 {
+                let previous_start_index = (counter - 2) * T::Hash::LEN;
+                let previous_end_index = (counter - 1) * T::Hash::LEN;
                 engine.input(&okm[previous_start_index..previous_end_index]);
             }
             engine.input(info);
-            engine.input(&[counter]);
+            engine.input(&[counter as u8]);
 
             let t = engine.finalize();
-            let start_index = (counter as usize - 1) * T::Bytes::LEN;
+            let start_index = (counter - 1) * T::Hash::LEN;
             // Last block might not take full hash length.
-            let end_index = if counter == (total_blocks as u8) {
-                okm.len()
-            } else {
-                counter as usize * T::Bytes::LEN
-            };
+            let end_index =
+                if counter == total_blocks { okm.len() } else { counter * T::Hash::LEN };
 
             okm[start_index..end_index].copy_from_slice(&t.as_ref()[0..(end_index - start_index)]);
-
-            counter += 1;
         }
 
         Ok(())
@@ -98,6 +104,11 @@ where
     ///
     /// Expand may be called multiple times to derive multiple keys,
     /// but the info must be independent from the ikm for security.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaxLengthError`] if the requested output length exceeds the maximum allowed
+    /// (255 * hash output length).
     #[cfg(feature = "alloc")]
     pub fn expand_to_len(&self, info: &[u8], len: usize) -> Result<Vec<u8>, MaxLengthError> {
         let mut okm = vec![0u8; len];
@@ -108,7 +119,7 @@ where
 
 impl<T: HashEngine> fmt::Debug for Hkdf<T> {
     fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-        use crate::{sha256t, sha256t_tag};
+        use crate::{sha256, sha256t};
 
         struct Fingerprint([u8; 8]); // Print 16 hex characters as a fingerprint.
 
@@ -116,8 +127,9 @@ impl<T: HashEngine> fmt::Debug for Hkdf<T> {
             fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { crate::debug_hex(&self.0, f) }
         }
 
-        sha256t_tag! {
-            pub struct Tag = hash_str("bitcoin_hashes1DEBUG");
+        struct Tag;
+        impl sha256t::Tag for Tag {
+            const MIDSTATE: sha256::Midstate = sha256::Midstate::hash_tag(b"bitcoin_hashes1DEBUG");
         }
 
         let hash = sha256t::Hash::<Tag>::hash(self.prk.as_ref());
@@ -126,20 +138,51 @@ impl<T: HashEngine> fmt::Debug for Hkdf<T> {
     }
 }
 
+/// Error types for the HKDF hash.
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
+
+    /// Size of output exceeds maximum length allowed.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct MaxLengthError {
+        pub(super) max: usize,
+    }
+
+    impl From<Infallible> for MaxLengthError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for MaxLengthError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "exceeds {} byte max output material limit", self.max)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for MaxLengthError {
+        #[inline]
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            let Self { max: _ } = self;
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 #[cfg(feature = "alloc")]
 #[cfg(feature = "hex")]
 mod tests {
-    use hex::prelude::{DisplayHex, FromHex};
+    use hex::DisplayHex;
 
     use super::*;
-    use crate::sha256;
+    use crate::{hex, sha256};
 
     #[test]
     fn rfc5869_basic() {
-        let salt = Vec::from_hex("000102030405060708090a0b0c").unwrap();
-        let ikm = Vec::from_hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
-        let info = Vec::from_hex("f0f1f2f3f4f5f6f7f8f9").unwrap();
+        let salt = hex::decode_to_vec("000102030405060708090a0b0c").unwrap();
+        let ikm = hex::decode_to_vec("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
+        let info = hex::decode_to_vec("f0f1f2f3f4f5f6f7f8f9").unwrap();
 
         let hkdf = Hkdf::<sha256::HashEngine>::new(&salt, &ikm);
         let mut okm = [0u8; 42];
@@ -153,13 +196,13 @@ mod tests {
 
     #[test]
     fn rfc5869_longer_inputs_outputs() {
-        let salt = Vec::from_hex(
+        let salt = hex::decode_to_vec(
             "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
         ).unwrap();
-        let ikm = Vec::from_hex(
+        let ikm = hex::decode_to_vec(
             "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f"
         ).unwrap();
-        let info = Vec::from_hex(
+        let info = hex::decode_to_vec(
             "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
         ).unwrap();
 
@@ -175,9 +218,9 @@ mod tests {
 
     #[test]
     fn too_long_okm() {
-        let salt = Vec::from_hex("000102030405060708090a0b0c").unwrap();
-        let ikm = Vec::from_hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
-        let info = Vec::from_hex("f0f1f2f3f4f5f6f7f8f9").unwrap();
+        let salt = hex::decode_to_vec("000102030405060708090a0b0c").unwrap();
+        let ikm = hex::decode_to_vec("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
+        let info = hex::decode_to_vec("f0f1f2f3f4f5f6f7f8f9").unwrap();
 
         let hkdf = Hkdf::<sha256::HashEngine>::new(&salt, &ikm);
         let mut okm = [0u8; 256 * 32];
@@ -187,10 +230,29 @@ mod tests {
     }
 
     #[test]
+    fn max_okm() {
+        let salt = hex::decode_to_vec("000102030405060708090a0b0c").unwrap();
+        let ikm = hex::decode_to_vec("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
+        let info = hex::decode_to_vec("f0f1f2f3f4f5f6f7f8f9").unwrap();
+
+        let hkdf = Hkdf::<sha256::HashEngine>::new(&salt, &ikm);
+        // The RFC-5869 maximum output length of `255 * hash length` must not panic.
+        let mut okm = [0u8; 255 * 32];
+        hkdf.expand(&info, &mut okm).unwrap();
+
+        // HKDF output is a stable prefix stream, so the first 42 bytes match the
+        // RFC-5869 test case 1 vector.
+        assert_eq!(
+            okm[..42].to_lower_hex_string(),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+        );
+    }
+
+    #[test]
     fn short_okm() {
-        let salt = Vec::from_hex("000102030405060708090a0b0c").unwrap();
-        let ikm = Vec::from_hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
-        let info = Vec::from_hex("f0f1f2f3f4f5f6f7f8f9").unwrap();
+        let salt = hex::decode_to_vec("000102030405060708090a0b0c").unwrap();
+        let ikm = hex::decode_to_vec("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
+        let info = hex::decode_to_vec("f0f1f2f3f4f5f6f7f8f9").unwrap();
 
         let hkdf = Hkdf::<sha256::HashEngine>::new(&salt, &ikm);
         let mut okm = [0u8; 1];
@@ -201,9 +263,9 @@ mod tests {
 
     #[test]
     fn alloc_wrapper() {
-        let salt = Vec::from_hex("000102030405060708090a0b0c").unwrap();
-        let ikm = Vec::from_hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
-        let info = Vec::from_hex("f0f1f2f3f4f5f6f7f8f9").unwrap();
+        let salt = hex::decode_to_vec("000102030405060708090a0b0c").unwrap();
+        let ikm = hex::decode_to_vec("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
+        let info = hex::decode_to_vec("f0f1f2f3f4f5f6f7f8f9").unwrap();
 
         let hkdf = Hkdf::<sha256::HashEngine>::new(&salt, &ikm);
         let okm = hkdf.expand_to_len(&info, 42).unwrap();
@@ -216,8 +278,8 @@ mod tests {
 
     #[test]
     fn debug() {
-        let salt = Vec::from_hex("000102030405060708090a0b0c").unwrap();
-        let ikm = Vec::from_hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
+        let salt = hex::decode_to_vec("000102030405060708090a0b0c").unwrap();
+        let ikm = hex::decode_to_vec("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
 
         let hkdf = Hkdf::<sha256::HashEngine>::new(&salt, &ikm);
         let debug = alloc::format!("{:?}", hkdf);

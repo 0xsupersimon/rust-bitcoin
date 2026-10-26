@@ -2,6 +2,8 @@
 
 //! Contains `TaprootMerkleBranchBuf` and its associated types.
 
+#[cfg(feature = "arbitrary")]
+use arbitrary::{Arbitrary, Unstructured};
 use hashes::Hash;
 
 use super::{
@@ -64,15 +66,13 @@ impl TaprootMerkleBranchBuf {
         if collection.as_ref().len() > TAPROOT_CONTROL_MAX_NODE_COUNT {
             Err(InvalidMerkleTreeDepthError(collection.as_ref().len()))
         } else {
-            Ok(TaprootMerkleBranchBuf(collection.into()))
+            Ok(Self(collection.into()))
         }
     }
 
     /// Serializes to a writer.
     ///
-    /// # Returns
-    ///
-    /// The number of bytes written to the writer.
+    /// Returns the number of bytes written to the writer.
     pub fn encode<Write: io::Write + ?Sized>(&self, writer: &mut Write) -> io::Result<usize> {
         for hash in self {
             writer.write_all(hash.as_ref())?;
@@ -266,3 +266,11 @@ impl DoubleEndedIterator for IntoIter {
 impl ExactSizeIterator for IntoIter {}
 
 impl core::iter::FusedIterator for IntoIter {}
+
+#[cfg(feature = "arbitrary")]
+impl<'a> Arbitrary<'a> for TaprootMerkleBranchBuf {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        let collection = Vec::<TapNodeHash>::arbitrary(u)?;
+        Ok(Self::from_collection(collection).map_err(|_| arbitrary::Error::IncorrectFormat)?)
+    }
+}

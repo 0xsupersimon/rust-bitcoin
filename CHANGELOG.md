@@ -1,12 +1,7 @@
+# Changelog
 
-A changelog is kept per crate, see:
+## [Unreleased]
 
-- [`bitcoin` CHANGELOG](bitcoin/CHANGELOG.md)
-- [`addresses` CHANGELOG](addresses/CHANGELOG.md)
-- [`base58` CHANGELOG](base58/CHANGELOG.md)
-- [`hashes` CHANGELOG](hashes/CHANGELOG.md)
-- [`internals` CHANGELOG](internals/CHANGELOG.md)
-- [`io` CHANGELOG](io/CHANGELOG.md)
-- [`primitives` CHANGELOG](primitives/CHANGELOG.md)
-- [`units` CHANGELOG](units/CHANGELOG.md)
+## 0.0.0 - Initial dummy release
 
+- Empty crate to reserve the name on crates.io

@@ -5,158 +5,103 @@
 //! This module provides support for Taproot tagged hashes.
 
 pub mod merkle_branch;
-pub mod serialized_signature;
 
 use core::cmp::{Ordering, Reverse};
-use core::convert::Infallible;
+#[cfg(feature = "serde")]
 use core::fmt;
 use core::iter::FusedIterator;
 
-use hashes::{hash_newtype, sha256t, sha256t_tag, HashEngine};
-use hex::{FromHex, HexToBytesError};
+#[cfg(feature = "arbitrary")]
+use arbitrary::{Arbitrary, Unstructured};
+use hashes::{sha256t, HashEngine};
 use internals::array::ArrayExt;
 #[allow(unused)] // MSRV polyfill
 use internals::slice::SliceExt;
-use internals::{impl_to_hex_from_lower_hex, write_err};
 use io::Write;
-use secp256k1::{Scalar, Secp256k1};
+#[cfg(feature = "serde")]
+use serde::Deserialize;
 
-use crate::consensus::Encodable;
 use crate::crypto::key::{
     SerializedXOnlyPublicKey, TapTweak, TweakedPublicKey, UntweakedPublicKey,
 };
-use crate::key::ParseXOnlyPublicKeyError;
 use crate::prelude::{BTreeMap, BTreeSet, BinaryHeap, Vec};
-use crate::{Script, ScriptBuf};
+use crate::{hex, TapScript, TapScriptBuf};
 
 // Re-export these so downstream only has to use one `taproot` module.
 #[rustfmt::skip]
 #[doc(inline)]
-pub use crate::crypto::taproot::{SigFromSliceError, Signature};
+pub use crate::crypto::taproot::{SerializedSignature, Signature};
 #[doc(inline)]
 pub use merkle_branch::TaprootMerkleBranch;
 #[doc(inline)]
 pub use merkle_branch::TaprootMerkleBranchBuf;
+#[doc(inline)]
+pub use taproot_primitives::{
+    FutureLeafVersion, LeafVersion, TapBranchTag, TapLeafHash, TapLeafTag, TapNodeHash,
+    TapTweakHash, TapTweakTag, TAPROOT_ANNEX_PREFIX, TAPROOT_CONTROL_BASE_SIZE,
+    TAPROOT_CONTROL_MAX_NODE_COUNT, TAPROOT_CONTROL_MAX_SIZE, TAPROOT_CONTROL_NODE_SIZE,
+    TAPROOT_LEAF_MASK, TAPROOT_LEAF_TAPSCRIPT,
+};
 
+#[doc(no_inline)]
+pub use self::error::{
+    HiddenNodesError, IncompleteBuilderError, InvalidControlBlockSizeError,
+    InvalidMerkleBranchSizeError, InvalidMerkleTreeDepthError, InvalidTaprootLeafVersionError,
+    SigFromSliceError, TaprootBuilderError, TaprootError,
+};
 #[doc(inline)]
 pub use crate::XOnlyPublicKey;
 
 type ControlBlockArrayVec = internals::array_vec::ArrayVec<u8, TAPROOT_CONTROL_MAX_SIZE>;
 
-// Taproot test vectors from BIP-341 state the hashes without any reversing
-sha256t_tag! {
-    pub struct TapLeafTag = hash_str("TapLeaf");
-}
-
-hash_newtype! {
-    /// Taproot-tagged hash with tag \"TapLeaf\".
-    ///
-    /// This is used for computing tapscript script spend hash.
-    pub struct TapLeafHash(sha256t::Hash<TapLeafTag>);
-}
-
-hashes::impl_hex_for_newtype!(TapLeafHash);
-#[cfg(feature = "serde")]
-hashes::impl_serde_for_newtype!(TapLeafHash);
-
-sha256t_tag! {
-    pub struct TapBranchTag = hash_str("TapBranch");
-}
-
-hash_newtype! {
-    /// Tagged hash used in Taproot trees.
-    ///
-    /// See BIP-340 for tagging rules.
-    #[repr(transparent)]
-    pub struct TapNodeHash(sha256t::Hash<TapBranchTag>);
-}
-
-hashes::impl_hex_for_newtype!(TapNodeHash);
-#[cfg(feature = "serde")]
-hashes::impl_serde_for_newtype!(TapNodeHash);
-
-sha256t_tag! {
-    pub struct TapTweakTag = hash_str("TapTweak");
-}
-
-hash_newtype! {
-    /// Taproot-tagged hash with tag \"TapTweak\".
-    ///
-    /// This hash type is used while computing the tweaked public key.
-    pub struct TapTweakHash(sha256t::Hash<TapTweakTag>);
-}
-
-hashes::impl_hex_for_newtype!(TapTweakHash);
-#[cfg(feature = "serde")]
-hashes::impl_serde_for_newtype!(TapTweakHash);
-
-impl From<TapLeafHash> for TapNodeHash {
-    fn from(leaf: TapLeafHash) -> TapNodeHash { TapNodeHash::from_byte_array(leaf.to_byte_array()) }
-}
-
-impl TapTweakHash {
-    /// Constructs a new BIP341 [`TapTweakHash`] from key and Merkle root. Produces `H_taptweak(P||R)` where
-    /// `P` is the internal key and `R` is the Merkle root.
-    pub fn from_key_and_merkle_root<K: Into<UntweakedPublicKey>>(
-        internal_key: K,
-        merkle_root: Option<TapNodeHash>,
-    ) -> TapTweakHash {
-        let internal_key = internal_key.into();
-        let mut eng = sha256t::Hash::<TapTweakTag>::engine();
-        // always hash the key
-        eng.input(&internal_key.serialize());
-        if let Some(h) = merkle_root {
-            eng.input(h.as_ref());
-        } else {
-            // nothing to hash
-        }
-        let inner = sha256t::Hash::<TapTweakTag>::from_engine(eng);
-        TapTweakHash::from_byte_array(inner.to_byte_array())
-    }
-
-    /// Converts a `TapTweakHash` into a `Scalar` ready for use with key tweaking API.
-    pub fn to_scalar(self) -> Scalar {
-        // This is statistically extremely unlikely to panic.
-        Scalar::from_be_bytes(self.to_byte_array()).expect("hash value greater than curve order")
-    }
-}
-
-impl TapLeafHash {
-    /// Computes the leaf hash from components.
-    pub fn from_script(script: &Script, ver: LeafVersion) -> TapLeafHash {
-        let mut eng = sha256t::Hash::<TapLeafTag>::engine();
-        ver.to_consensus().consensus_encode(&mut eng).expect("engines don't error");
-        script.consensus_encode(&mut eng).expect("engines don't error");
-        let inner = sha256t::Hash::<TapLeafTag>::from_engine(eng);
-        TapLeafHash::from_byte_array(inner.to_byte_array())
-    }
-}
-
 impl From<LeafNode> for TapNodeHash {
-    fn from(leaf: LeafNode) -> TapNodeHash { leaf.node_hash() }
+    fn from(leaf: LeafNode) -> Self { leaf.node_hash() }
 }
 
 impl From<&LeafNode> for TapNodeHash {
-    fn from(leaf: &LeafNode) -> TapNodeHash { leaf.node_hash() }
+    fn from(leaf: &LeafNode) -> Self { leaf.node_hash() }
 }
 
-impl TapNodeHash {
-    /// Computes branch hash given two hashes of the nodes underneath it.
-    pub fn from_node_hashes(a: TapNodeHash, b: TapNodeHash) -> TapNodeHash {
-        combine_node_hashes(a, b).0
+crate::internal_macros::define_extension_trait! {
+    /// Extension functionality for the [`TapLeafHash`] type.
+    pub trait TapLeafHashExt impl for TapLeafHash {
+        /// Computes the leaf hash from components.
+        fn from_script(script: &TapScript, ver: LeafVersion) -> Self {
+            let mut eng = sha256t::Hash::<TapLeafTag>::engine();
+            eng.input(&[ver.to_consensus()]);
+            hashes::encode_to_engine(script, &mut eng);
+            let inner = sha256t::Hash::<TapLeafTag>::from_engine(eng);
+            Self::from_byte_array(inner.to_byte_array())
+        }
     }
+}
 
-    /// Assumes the given 32 byte array as hidden [`TapNodeHash`].
-    ///
-    /// Similar to [`TapLeafHash::from_byte_array`], but explicitly conveys that the
-    /// hash is constructed from a hidden node. This also has better ergonomics
-    /// because it does not require the caller to import the Hash trait.
-    pub fn assume_hidden(hash: [u8; 32]) -> TapNodeHash { TapNodeHash::from_byte_array(hash) }
+crate::internal_macros::define_extension_trait! {
+    /// Extension functionality for the [`TapNodeHash`] type.
+    pub trait TapNodeHashExt impl for TapNodeHash {
+        /// Computes branch hash given two hashes of the nodes underneath it.
+        fn from_node_hashes(a: Self, b: Self) -> Self {
+            combine_node_hashes(a, b).0
+        }
 
-    /// Computes the [`TapNodeHash`] from a script and a leaf version.
-    pub fn from_script(script: &Script, ver: LeafVersion) -> TapNodeHash {
-        TapNodeHash::from(TapLeafHash::from_script(script, ver))
+        /// Assumes the given 32 byte array as hidden [`TapNodeHash`].
+        ///
+        /// Similar to [`TapLeafHash::from_byte_array`], but explicitly conveys that the
+        /// hash is constructed from a hidden node. This also has better ergonomics
+        /// because it does not require the caller to import the Hash trait.
+        fn assume_hidden(hash: [u8; 32]) -> Self { Self::from_byte_array(hash) }
+
+        /// Computes the [`TapNodeHash`] from a script and a leaf version.
+        fn from_script(script: &TapScript, ver: LeafVersion) -> Self {
+            Self::from(TapLeafHash::from_script(script, ver))
+        }
     }
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::TapLeafHash {}
+    impl Sealed for super::TapNodeHash {}
 }
 
 /// Computes branch hash given two hashes of the nodes underneath it and returns
@@ -174,39 +119,17 @@ fn combine_node_hashes(a: TapNodeHash, b: TapNodeHash) -> (TapNodeHash, bool) {
     (TapNodeHash::from_byte_array(inner.to_byte_array()), a < b)
 }
 
-/// Maximum depth of a Taproot tree script spend path.
-// https://github.com/bitcoin/bitcoin/blob/e826b22da252e0599c61d21c98ff89f366b3120f/src/script/interpreter.h#L229
-pub const TAPROOT_CONTROL_MAX_NODE_COUNT: usize = 128;
-/// Size of a Taproot control node.
-// https://github.com/bitcoin/bitcoin/blob/e826b22da252e0599c61d21c98ff89f366b3120f/src/script/interpreter.h#L228
-pub const TAPROOT_CONTROL_NODE_SIZE: usize = 32;
-/// Tapleaf mask for getting the leaf version from first byte of control block.
-// https://github.com/bitcoin/bitcoin/blob/e826b22da252e0599c61d21c98ff89f366b3120f/src/script/interpreter.h#L225
-pub const TAPROOT_LEAF_MASK: u8 = 0xfe;
-/// Tapscript leaf version.
-// https://github.com/bitcoin/bitcoin/blob/e826b22da252e0599c61d21c98ff89f366b3120f/src/script/interpreter.h#L226
-pub const TAPROOT_LEAF_TAPSCRIPT: u8 = 0xc0;
-/// Taproot annex prefix.
-pub const TAPROOT_ANNEX_PREFIX: u8 = 0x50;
-/// Tapscript control base size.
-// https://github.com/bitcoin/bitcoin/blob/e826b22da252e0599c61d21c98ff89f366b3120f/src/script/interpreter.h#L227
-pub const TAPROOT_CONTROL_BASE_SIZE: usize = 33;
-/// Tapscript control max size.
-// https://github.com/bitcoin/bitcoin/blob/e826b22da252e0599c61d21c98ff89f366b3120f/src/script/interpreter.h#L230
-pub const TAPROOT_CONTROL_MAX_SIZE: usize =
-    TAPROOT_CONTROL_BASE_SIZE + TAPROOT_CONTROL_NODE_SIZE * TAPROOT_CONTROL_MAX_NODE_COUNT;
-
 /// The leaf script with its version.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct LeafScript<S> {
     /// The version of the script.
     pub version: LeafVersion,
-    /// The script, usually `ScriptBuf` or `&Script`.
+    /// The script, usually `TapScriptBuf` or `&TapScript`.
     pub script: S,
 }
 
 // type alias for versioned tap script corresponding Merkle proof
-type ScriptMerkleProofMap = BTreeMap<(ScriptBuf, LeafVersion), BTreeSet<TaprootMerkleBranchBuf>>;
+type ScriptMerkleProofMap = BTreeMap<(TapScriptBuf, LeafVersion), BTreeSet<TaprootMerkleBranchBuf>>;
 
 /// Represents Taproot spending information.
 ///
@@ -221,15 +144,16 @@ type ScriptMerkleProofMap = BTreeMap<(ScriptBuf, LeafVersion), BTreeSet<TaprootM
 ///   control block.
 ///
 /// If one or more of the spending conditions consist of just a single key (after aggregation), the
-/// most likely key should be made the internal key.
-/// See [BIP341](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki) for more details on
-/// choosing internal keys for a Taproot application.
+/// most likely key should be made the internal key. See [BIP-0341] for more details on choosing
+/// internal keys for a Taproot application.
 ///
 /// Note: This library currently does not support
 /// [annex](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki#cite_note-5).
+///
+/// [BIP-0341]: <https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki>
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaprootSpendInfo {
-    /// The BIP341 internal key.
+    /// The BIP-0341 internal key.
     internal_key: UntweakedPublicKey,
     /// The Merkle root of the script tree (None if there are no scripts).
     merkle_root: Option<TapNodeHash>,
@@ -249,24 +173,22 @@ impl TaprootSpendInfo {
     /// weights of satisfaction for that script.
     ///
     /// See [`TaprootBuilder::with_huffman_tree`] for more detailed documentation.
-    pub fn with_huffman_tree<C, I, K>(
-        secp: &Secp256k1<C>,
+    pub fn with_huffman_tree<I, K>(
         internal_key: K,
         script_weights: I,
     ) -> Result<Self, TaprootBuilderError>
     where
-        I: IntoIterator<Item = (u32, ScriptBuf)>,
-        C: secp256k1::Verification,
+        I: IntoIterator<Item = (u32, TapScriptBuf)>,
         K: Into<UntweakedPublicKey>,
     {
         let builder = TaprootBuilder::with_huffman_tree(script_weights)?;
-        Ok(builder.finalize(secp, internal_key).expect("Huffman tree is always complete"))
+        Ok(builder.finalize(internal_key).expect("Huffman tree is always complete"))
     }
 
     /// Constructs a new key spend with `internal_key` and `merkle_root`. Provide [`None`] for
     /// the `merkle_root` if there is no script path.
     ///
-    /// *Note*: As per BIP341
+    /// *Note*: As per BIP-0341
     ///
     /// When the Merkle root is [`None`], the output key commits to an unspendable script path
     /// instead of having no script path. This is achieved by computing the output key point as
@@ -274,17 +196,16 @@ impl TaprootSpendInfo {
     ///
     /// Refer to BIP 341 footnote ('Why should the output key always have a Taproot commitment, even
     /// if there is no script path?') for more details.
-    pub fn new_key_spend<C: secp256k1::Verification, K: Into<UntweakedPublicKey>>(
-        secp: &Secp256k1<C>,
+    pub fn new_key_spend<K: Into<UntweakedPublicKey>>(
         internal_key: K,
         merkle_root: Option<TapNodeHash>,
     ) -> Self {
         let internal_key = internal_key.into();
-        let (output_key, parity) = internal_key.tap_tweak(secp, merkle_root);
+        let output_key = internal_key.tap_tweak(merkle_root);
         Self {
             internal_key,
             merkle_root,
-            output_key_parity: parity,
+            output_key_parity: output_key.as_x_only_public_key().parity(),
             output_key,
             script_map: BTreeMap::new(),
         }
@@ -315,14 +236,10 @@ impl TaprootSpendInfo {
     ///
     /// This is useful when you want to manually build a Taproot tree without using
     /// [`TaprootBuilder`].
-    pub fn from_node_info<C: secp256k1::Verification, K: Into<UntweakedPublicKey>>(
-        secp: &Secp256k1<C>,
-        internal_key: K,
-        node: NodeInfo,
-    ) -> TaprootSpendInfo {
+    pub fn from_node_info<K: Into<UntweakedPublicKey>>(internal_key: K, node: NodeInfo) -> Self {
         // Create as if it is a key spend path with the given Merkle root
         let root_hash = Some(node.hash);
-        let mut info = TaprootSpendInfo::new_key_spend(secp, internal_key, root_hash);
+        let mut info = Self::new_key_spend(internal_key, root_hash);
 
         for leaves in node.leaves {
             match leaves.leaf {
@@ -354,13 +271,13 @@ impl TaprootSpendInfo {
     ///
     /// - If there are multiple control blocks possible, returns the shortest one.
     /// - If the script is not contained in the [`TaprootSpendInfo`], returns `None`.
-    pub fn control_block(&self, script_ver: &(ScriptBuf, LeafVersion)) -> Option<ControlBlock> {
+    pub fn control_block(&self, script_ver: &(TapScriptBuf, LeafVersion)) -> Option<ControlBlock> {
         let merkle_branch_set = self.script_map.get(script_ver)?;
         // Choose the smallest one amongst the multiple script maps
         let smallest = merkle_branch_set
             .iter()
             .min_by(|x, y| x.len().cmp(&y.len()))
-            .expect("Invariant: ScriptBuf map key must contain non-empty set value");
+            .expect("Invariant: TapScriptBuf map key must contain non-empty set value");
         Some(ControlBlock {
             internal_key: self.internal_key,
             output_key_parity: self.output_key_parity,
@@ -371,11 +288,11 @@ impl TaprootSpendInfo {
 }
 
 impl From<TaprootSpendInfo> for TapTweakHash {
-    fn from(spend_info: TaprootSpendInfo) -> TapTweakHash { spend_info.tap_tweak() }
+    fn from(spend_info: TaprootSpendInfo) -> Self { spend_info.tap_tweak() }
 }
 
 impl From<&TaprootSpendInfo> for TapTweakHash {
-    fn from(spend_info: &TaprootSpendInfo) -> TapTweakHash { spend_info.tap_tweak() }
+    fn from(spend_info: &TaprootSpendInfo) -> Self { spend_info.tap_tweak() }
 }
 
 /// Builder for building Taproot iteratively. Users can specify tap leaf or omitted/hidden branches
@@ -416,20 +333,18 @@ pub struct TaprootBuilder {
     // 128 entries (as that would mean more than 128 levels in the tree). The depth of newly added
     // entries will always be at least equal to the current size of branch (otherwise it does not
     // correspond to a depth-first traversal of a tree). A branch is only empty if no entries have
-    // ever be processed. A branch having length 1 corresponds to being done.
+    // ever been processed. A branch having length 1 corresponds to being done.
     branch: Vec<Option<NodeInfo>>,
 }
 
 impl TaprootBuilder {
     /// Constructs a new instance of [`TaprootBuilder`].
-    pub fn new() -> Self { TaprootBuilder { branch: vec![] } }
+    pub fn new() -> Self { Self { branch: vec![] } }
 
     /// Constructs a new instance of [`TaprootBuilder`] with a capacity hint for `size` elements.
     ///
     /// The size here should be maximum depth of the tree.
-    pub fn with_capacity(size: usize) -> Self {
-        TaprootBuilder { branch: Vec::with_capacity(size) }
-    }
+    pub fn with_capacity(size: usize) -> Self { Self { branch: Vec::with_capacity(size) } }
 
     /// Constructs a new [`TaprootSpendInfo`] from a list of scripts (with default script version) and
     /// weights of satisfaction for that script.
@@ -437,7 +352,7 @@ impl TaprootBuilder {
     /// The weights represent the probability of each branch being taken. If probabilities/weights
     /// for each condition are known, constructing the tree as a Huffman tree is the optimal way to
     /// minimize average case satisfaction cost. This function takes as input an iterator of
-    /// `tuple(u32, ScriptBuf)` where `u32` represents the satisfaction weights of the branch. For
+    /// `tuple(u32, TapScriptBuf)` where `u32` represents the satisfaction weights of the branch. For
     /// example, [(3, S1), (2, S2), (5, S3)] would construct a [`TapTree`] that has optimal
     /// satisfaction weight when probability for S1 is 30%, S2 is 20% and S3 is 50%.
     ///
@@ -454,7 +369,7 @@ impl TaprootBuilder {
     /// [`TapTree`]: crate::taproot::TapTree
     pub fn with_huffman_tree<I>(script_weights: I) -> Result<Self, TaprootBuilderError>
     where
-        I: IntoIterator<Item = (u32, ScriptBuf)>,
+        I: IntoIterator<Item = (u32, TapScriptBuf)>,
     {
         let mut node_weights = BinaryHeap::<(Reverse<u32>, NodeInfo)>::new();
         for (p, leaf) in script_weights {
@@ -469,7 +384,7 @@ impl TaprootBuilder {
             let (p1, s1) = node_weights.pop().expect("len must be at least two");
             let (p2, s2) = node_weights.pop().expect("len must be at least two");
             // Insert the sum of first two in the tree as a new node
-            // N.B.: p1 + p2 can not practically saturate as you would need to have 2**32 max u32s
+            // N.B.: p1 + p2 cannot practically saturate as you would need to have 2**32 max u32s
             // from the input to overflow. However, saturating is a reasonable behavior here as
             // Huffman tree construction would treat all such elements as "very likely".
             let p = Reverse(p1.0.saturating_add(p2.0));
@@ -479,7 +394,7 @@ impl TaprootBuilder {
         // Therefore, the loop will eventually terminate with exactly 1 element
         debug_assert_eq!(node_weights.len(), 1);
         let node = node_weights.pop().expect("Huffman tree algorithm is broken").1;
-        Ok(TaprootBuilder { branch: vec![Some(node)] })
+        Ok(Self { branch: vec![Some(node)] })
     }
 
     /// Adds a leaf script at `depth` to the builder with script version `ver`.
@@ -492,7 +407,7 @@ impl TaprootBuilder {
     pub fn add_leaf_with_ver(
         self,
         depth: u8,
-        script: ScriptBuf,
+        script: TapScriptBuf,
         ver: LeafVersion,
     ) -> Result<Self, TaprootBuilderError> {
         let leaf = NodeInfo::new_leaf_with_ver(script, ver);
@@ -508,7 +423,7 @@ impl TaprootBuilder {
     /// # Errors
     ///
     /// Errors if the leaves are not provided in DFS walk order.
-    pub fn add_leaf(self, depth: u8, script: ScriptBuf) -> Result<Self, TaprootBuilderError> {
+    pub fn add_leaf(self, depth: u8, script: TapScriptBuf) -> Result<Self, TaprootBuilderError> {
         self.add_leaf_with_ver(depth, script, LeafVersion::TapScript)
     }
 
@@ -570,9 +485,7 @@ impl TaprootBuilder {
         let node = self.try_into_node_info()?;
         if node.has_hidden_nodes {
             // Reconstruct the builder as it was if it has hidden nodes
-            return Err(IncompleteBuilderError::HiddenParts(TaprootBuilder {
-                branch: vec![Some(node)],
-            }));
+            return Err(IncompleteBuilderError::HiddenParts(Self { branch: vec![Some(node)] }));
         }
         Ok(TapTree(node))
     }
@@ -584,19 +497,18 @@ impl TaprootBuilder {
 
     /// Constructs a new [`TaprootSpendInfo`] with the given internal key.
     ///
-    /// Returns the unmodified builder as Err if the builder is not finalizable.
+    /// Returns the unmodified builder as `Err` if the builder is not finalizable.
     /// See also [`TaprootBuilder::is_finalizable`]
-    pub fn finalize<C: secp256k1::Verification, K: Into<XOnlyPublicKey>>(
+    pub fn finalize<K: Into<XOnlyPublicKey>>(
         mut self,
-        secp: &Secp256k1<C>,
         internal_key: K,
-    ) -> Result<TaprootSpendInfo, TaprootBuilder> {
+    ) -> Result<TaprootSpendInfo, Self> {
         let internal_key = internal_key.into();
         match self.branch.len() {
-            0 => Ok(TaprootSpendInfo::new_key_spend(secp, internal_key, None)),
+            0 => Ok(TaprootSpendInfo::new_key_spend(internal_key, None)),
             1 =>
                 if let Some(Some(node)) = self.branch.pop() {
-                    Ok(TaprootSpendInfo::from_node_info(secp, internal_key, node))
+                    Ok(TaprootSpendInfo::from_node_info(internal_key, node))
                 } else {
                     unreachable!("size checked above. Builder guarantees the last element is Some")
                 },
@@ -609,7 +521,7 @@ impl TaprootBuilder {
     /// Inserts a leaf at `depth`.
     fn insert(mut self, mut node: NodeInfo, mut depth: u8) -> Result<Self, TaprootBuilderError> {
         // early error on invalid depth. Though this will be checked later
-        // while constructing TaprootMerkelBranch
+        // while constructing TaprootMerkleBranch
         if depth as usize > TAPROOT_CONTROL_MAX_NODE_COUNT {
             return Err(InvalidMerkleTreeDepthError(depth as usize).into());
         }
@@ -656,108 +568,12 @@ impl Default for TaprootBuilder {
     fn default() -> Self { Self::new() }
 }
 
-/// Error happening when [`TapTree`] is constructed from a [`TaprootBuilder`]
-/// having hidden branches or not being finalized.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum IncompleteBuilderError {
-    /// Indicates an attempt to construct a Taproot tree from a builder containing incomplete branches.
-    NotFinalized(TaprootBuilder),
-    /// Indicates an attempt to construct a Taproot tree from a builder containing hidden parts.
-    HiddenParts(TaprootBuilder),
-}
-
-impl From<Infallible> for IncompleteBuilderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl IncompleteBuilderError {
-    /// Converts error into the original incomplete [`TaprootBuilder`] instance.
-    pub fn into_builder(self) -> TaprootBuilder {
-        use IncompleteBuilderError::*;
-
-        match self {
-            NotFinalized(builder) | HiddenParts(builder) => builder,
-        }
-    }
-}
-
-impl core::fmt::Display for IncompleteBuilderError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        use IncompleteBuilderError::*;
-
-        f.write_str(match self {
-            NotFinalized(_) =>
-                "an attempt to construct a Taproot tree from a builder containing incomplete branches",
-            HiddenParts(_) =>
-                "an attempt to construct a Taproot tree from a builder containing hidden parts",
-        })
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for IncompleteBuilderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        use IncompleteBuilderError::*;
-
-        match *self {
-            NotFinalized(_) | HiddenParts(_) => None,
-        }
-    }
-}
-
-/// Error happening when [`TapTree`] is constructed from a [`NodeInfo`]
-/// having hidden branches.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum HiddenNodesError {
-    /// Indicates an attempt to construct a Taproot tree from a builder containing hidden parts.
-    HiddenParts(NodeInfo),
-}
-
-impl From<Infallible> for HiddenNodesError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl HiddenNodesError {
-    /// Converts error into the original incomplete [`NodeInfo`] instance.
-    pub fn into_node_info(self) -> NodeInfo {
-        use HiddenNodesError::*;
-
-        match self {
-            HiddenParts(node_info) => node_info,
-        }
-    }
-}
-
-impl core::fmt::Display for HiddenNodesError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        use HiddenNodesError::*;
-
-        f.write_str(match self {
-            HiddenParts(_) =>
-                "an attempt to construct a Taproot tree from a node_info containing hidden parts",
-        })
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for HiddenNodesError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        use HiddenNodesError::*;
-
-        match self {
-            HiddenParts(_) => None,
-        }
-    }
-}
-
 /// Taproot tree representing a complete binary tree without any hidden nodes.
 ///
 /// This is in contrast to [`NodeInfo`], which allows hidden nodes.
 /// The implementations for Eq, PartialEq and Hash compare the Merkle root of the tree
 //
-// This is a bug in BIP370 that does not specify how to share trees with hidden nodes,
+// This is a bug in BIP-0370 that does not specify how to share trees with hidden nodes,
 // for which we need a separate type.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -777,7 +593,7 @@ impl TapTree {
     /// Gets the inner [`NodeInfo`] of this tree root.
     pub fn into_node_info(self) -> NodeInfo { self.0 }
 
-    /// Returns [`TapTreeIter<'_>`] iterator for a Taproot script tree, operating in DFS order over
+    /// Returns [`ScriptLeaves<'_>`] iterator for a Taproot script tree, operating in DFS order over
     /// tree [`ScriptLeaf`]s.
     pub fn script_leaves(&self) -> ScriptLeaves<'_> {
         ScriptLeaves { leaf_iter: self.0.leaf_nodes() }
@@ -794,7 +610,7 @@ impl TryFrom<TaprootBuilder> for TapTree {
     ///
     /// # Returns
     ///
-    /// A [`TapTree`] iff the `builder` is complete, otherwise return [`IncompleteBuilderError`]
+    /// A [`TapTree`] if and only if the `builder` is complete, otherwise return [`IncompleteBuilderError`]
     /// error with the content of incomplete `builder` instance.
     fn try_from(builder: TaprootBuilder) -> Result<Self, Self::Error> {
         builder.try_into_tap_tree()
@@ -808,13 +624,13 @@ impl TryFrom<NodeInfo> for TapTree {
     ///
     /// # Returns
     ///
-    /// A [`TapTree`] iff the [`NodeInfo`] has no hidden nodes, otherwise return
+    /// A [`TapTree`] if and only if the [`NodeInfo`] has no hidden nodes, otherwise return
     /// [`HiddenNodesError`] error with the content of incomplete [`NodeInfo`] instance.
     fn try_from(node_info: NodeInfo) -> Result<Self, Self::Error> {
         if node_info.has_hidden_nodes {
             Err(HiddenNodesError::HiddenParts(node_info))
         } else {
-            Ok(TapTree(node_info))
+            Ok(Self(node_info))
         }
     }
 }
@@ -904,7 +720,7 @@ impl Ord for NodeInfo {
 }
 
 impl PartialOrd for NodeInfo {
-    fn partial_cmp(&self, other: &NodeInfo) -> Option<Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
 }
 
 impl PartialEq for NodeInfo {
@@ -923,8 +739,8 @@ impl NodeInfo {
         Self { hash, leaves: vec![], has_hidden_nodes: true }
     }
 
-    /// Constructs a new leaf [`NodeInfo`] with given [`ScriptBuf`] and [`LeafVersion`].
-    pub fn new_leaf_with_ver(script: ScriptBuf, ver: LeafVersion) -> Self {
+    /// Constructs a new leaf [`NodeInfo`] with given [`TapScriptBuf`] and [`LeafVersion`].
+    pub fn new_leaf_with_ver(script: TapScriptBuf, ver: LeafVersion) -> Self {
         Self {
             hash: TapNodeHash::from_script(&script, ver),
             leaves: vec![LeafNode::new_script(script, ver)],
@@ -952,7 +768,7 @@ impl NodeInfo {
         })
     }
 
-    /// Creates an iterator over all leaves (including hidden leaves) in the tree.
+    /// Constructs an iterator over all leaves (including hidden leaves) in the tree.
     pub fn leaf_nodes(&self) -> LeafNodes<'_> { LeafNodes { leaf_iter: self.leaves.iter() } }
 
     /// Returns the root [`TapNodeHash`] of this node info.
@@ -1044,7 +860,7 @@ impl<'de> serde::Deserialize<'de> for NodeInfo {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum TapLeaf {
     /// A known script
-    Script(ScriptBuf, LeafVersion),
+    Script(TapScriptBuf, LeafVersion),
     /// Hidden Node with the given leaf hash
     Hidden(TapNodeHash),
 }
@@ -1060,7 +876,7 @@ impl TapLeaf {
     }
 
     /// Obtains a reference to script and version if the leaf is known.
-    pub fn as_script(&self) -> Option<(&Script, LeafVersion)> {
+    pub fn as_script(&self) -> Option<(&TapScript, LeafVersion)> {
         if let Self::Script(script, ver) = self {
             Some((script, *ver))
         } else {
@@ -1080,7 +896,7 @@ pub struct LeafNode {
 
 impl LeafNode {
     /// Constructs a new [`ScriptLeaf`] from `script` and `ver` and no Merkle branch.
-    pub fn new_script(script: ScriptBuf, ver: LeafVersion) -> Self {
+    pub fn new_script(script: TapScriptBuf, ver: LeafVersion) -> Self {
         Self { leaf: TapLeaf::Script(script, ver), merkle_branch: Default::default() }
     }
 
@@ -1122,7 +938,7 @@ impl LeafNode {
 
     /// Returns reference to the leaf script if the leaf is known.
     #[inline]
-    pub fn script(&self) -> Option<&Script> { self.leaf.as_script().map(|x| x.0) }
+    pub fn script(&self) -> Option<&TapScript> { self.leaf.as_script().map(|x| x.0) }
 
     /// Returns leaf version of the script if the leaf is known.
     #[inline]
@@ -1145,7 +961,7 @@ pub struct ScriptLeaf<'leaf> {
     /// The version of the script leaf.
     version: LeafVersion,
     /// The script.
-    script: &'leaf Script,
+    script: &'leaf TapScript,
     /// The Merkle proof (hashing partners) to get this node.
     merkle_branch: &'leaf TaprootMerkleBranch,
 }
@@ -1155,7 +971,7 @@ impl<'leaf> ScriptLeaf<'leaf> {
     pub fn version(&self) -> LeafVersion { self.version }
 
     /// Obtains a reference to the script inside the leaf.
-    pub fn script(&self) -> &Script { self.script }
+    pub fn script(&self) -> &TapScript { self.script }
 
     /// Obtains a reference to the Merkle proof of the leaf.
     pub fn merkle_branch(&self) -> &TaprootMerkleBranch { self.merkle_branch }
@@ -1189,7 +1005,7 @@ impl ControlBlock {
     ///
     /// This is an extra witness element that provides the proof that Taproot script pubkey is
     /// correctly computed with some specified leaf hash. This is the last element in Taproot
-    /// witness when spending a output via script path.
+    /// witness when spending an output via script path.
     ///
     /// # Errors
     ///
@@ -1197,7 +1013,7 @@ impl ControlBlock {
     /// - [`TaprootError::InvalidTaprootLeafVersion`] if first byte of `sl` is not a valid leaf version.
     /// - [`TaprootError::InvalidInternalKey`] if internal key is invalid (first 32 bytes after the parity byte).
     /// - [`TaprootError::InvalidMerkleTreeDepth`] if Merkle tree is too deep (more than 128 levels).
-    pub fn decode(sl: &[u8]) -> Result<ControlBlock, TaprootError> {
+    pub fn decode(sl: &[u8]) -> Result<Self, TaprootError> {
         use alloc::borrow::ToOwned;
 
         let ControlBlock { leaf_version, output_key_parity, internal_key, merkle_branch } =
@@ -1206,13 +1022,13 @@ impl ControlBlock {
         let internal_key = internal_key.to_validated().map_err(TaprootError::InvalidInternalKey)?;
         let merkle_branch = merkle_branch.to_owned();
 
-        Ok(ControlBlock { leaf_version, output_key_parity, internal_key, merkle_branch })
+        Ok(Self { leaf_version, output_key_parity, internal_key, merkle_branch })
     }
 
     /// Constructs a new [`ControlBlock`] from a hex string.
     pub fn from_hex(hex: &str) -> Result<Self, TaprootError> {
-        let vec = Vec::from_hex(hex).map_err(TaprootError::InvalidControlBlockHex)?;
-        ControlBlock::decode(vec.as_slice())
+        let vec = hex::decode_to_vec(hex).map_err(TaprootError::InvalidControlBlockHex)?;
+        Self::decode(vec.as_slice())
     }
 }
 
@@ -1236,7 +1052,7 @@ impl<B, K> ControlBlock<B, K> {
         let leaf_version = LeafVersion::from_consensus(first & TAPROOT_LEAF_MASK)?;
         let internal_key = SerializedXOnlyPublicKey::from_bytes_ref(internal_key).into();
         let merkle_branch = TaprootMerkleBranch::decode(merkle_branch)?.into();
-        Ok(ControlBlock { leaf_version, output_key_parity, internal_key, merkle_branch })
+        Ok(Self { leaf_version, output_key_parity, internal_key, merkle_branch })
     }
 }
 
@@ -1249,9 +1065,7 @@ impl<Branch: AsRef<TaprootMerkleBranch> + ?Sized> ControlBlock<Branch> {
 
     /// Serializes to a writer.
     ///
-    /// # Returns
-    ///
-    /// The number of bytes written to the writer.
+    /// Returns the number of bytes written to the writer.
     pub fn encode<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<usize> {
         self.encode_inner(move |bytes| writer.write_all(bytes))?;
         Ok(self.size())
@@ -1271,16 +1085,17 @@ impl<Branch: AsRef<TaprootMerkleBranch> + ?Sized> ControlBlock<Branch> {
         let first_byte: u8 =
             i32::from(self.output_key_parity) as u8 | self.leaf_version.to_consensus();
         write(&[first_byte])?;
-        write(&self.internal_key.serialize())?;
+        write(&self.internal_key.serialize().0)?;
         write(self.merkle_branch.as_ref().as_bytes())?;
         Ok(())
     }
 
     /// Serializes the control block.
     ///
-    /// This would be required when using [`ControlBlock`] as a witness element while spending an
-    /// output via script path. This serialization does not include the varint prefix that would be
-    /// applied when encoding this element as a witness.
+    /// This is required when using [`ControlBlock`] as a witness element while spending an output
+    /// via a script path. This serialization does not include the length prefix. When the
+    /// serialization returned by this function is later encoded as a witness element the length
+    /// prefix is added.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.size());
         self.encode(&mut buf).expect("writers don't error");
@@ -1291,11 +1106,10 @@ impl<Branch: AsRef<TaprootMerkleBranch> + ?Sized> ControlBlock<Branch> {
     ///
     /// Only checks that script is contained inside the [`TapTree`] described by output key. Full
     /// verification must also execute the script with witness data.
-    pub fn verify_taproot_commitment<C: secp256k1::Verification>(
+    pub fn verify_taproot_commitment(
         &self,
-        secp: &Secp256k1<C>,
         output_key: XOnlyPublicKey,
-        script: &Script,
+        script: &TapScript,
     ) -> bool {
         // compute the script hash
         // Initially the curr_hash is the leaf hash
@@ -1308,393 +1122,381 @@ impl<Branch: AsRef<TaprootMerkleBranch> + ?Sized> ControlBlock<Branch> {
         // compute the taptweak
         let tweak =
             TapTweakHash::from_key_and_merkle_root(self.internal_key, Some(curr_hash)).to_scalar();
-        self.internal_key.tweak_add_check(secp, &output_key, self.output_key_parity, tweak)
+        self.internal_key.tweak_add_check(&output_key.with_parity(self.output_key_parity), tweak)
     }
 }
 
-/// Inner type representing future (non-tapscript) leaf versions. See [`LeafVersion::Future`].
-///
-/// NB: NO PUBLIC CONSTRUCTOR!
-/// The only way to construct this is by converting `u8` to [`LeafVersion`] and then extracting it.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub struct FutureLeafVersion(u8);
+/// Error types for taproot.
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
 
-impl FutureLeafVersion {
-    pub(self) fn from_consensus(
-        version: u8,
-    ) -> Result<FutureLeafVersion, InvalidTaprootLeafVersionError> {
-        match version {
-            TAPROOT_LEAF_TAPSCRIPT => unreachable!(
-                "FutureLeafVersion::from_consensus should never be called for 0xC0 value"
-            ),
-            TAPROOT_ANNEX_PREFIX => Err(InvalidTaprootLeafVersionError(TAPROOT_ANNEX_PREFIX)),
-            odd if odd & 0xFE != odd => Err(InvalidTaprootLeafVersionError(odd)),
-            even => Ok(FutureLeafVersion(even)),
-        }
-    }
+    use internals::write_err;
 
-    /// Returns the consensus representation of this [`FutureLeafVersion`].
-    #[inline]
-    pub fn to_consensus(self) -> u8 { self.0 }
-}
+    use super::{
+        NodeInfo, TaprootBuilder, TAPROOT_CONTROL_MAX_NODE_COUNT, TAPROOT_CONTROL_NODE_SIZE,
+    };
+    use crate::hex::DecodeVariableLengthBytesError;
+    use crate::key::ParseXOnlyPublicKeyError;
 
-impl fmt::Display for FutureLeafVersion {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
-}
+    #[rustfmt::skip]
+    #[doc(inline)]
+    pub use crate::crypto::taproot::SigFromSliceError;
+    #[doc(no_inline)]
+    pub use taproot_primitives::InvalidTaprootLeafVersionError;
 
-impl fmt::LowerHex for FutureLeafVersion {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::LowerHex::fmt(&self.0, f) }
-}
-impl_to_hex_from_lower_hex!(FutureLeafVersion, |_| 2);
-
-impl fmt::UpperHex for FutureLeafVersion {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::UpperHex::fmt(&self.0, f) }
-}
-
-/// The leaf version for tapleafs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum LeafVersion {
-    /// BIP-342 tapscript.
-    TapScript,
-
-    /// Future leaf version.
-    Future(FutureLeafVersion),
-}
-
-impl LeafVersion {
-    /// Constructs a new [`LeafVersion`] from consensus byte representation.
+    /// Error happening when [`TapTree`] is constructed from a [`TaprootBuilder`]
+    /// having hidden branches or not being finalized.
     ///
-    /// # Errors
+    /// [`TapTree`]: super::TapTree
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum IncompleteBuilderError {
+        /// Indicates an attempt to construct a Taproot tree from a builder containing incomplete branches.
+        NotFinalized(TaprootBuilder),
+        /// Indicates an attempt to construct a Taproot tree from a builder containing hidden parts.
+        HiddenParts(TaprootBuilder),
+    }
+
+    impl IncompleteBuilderError {
+        /// Converts error into the original incomplete [`TaprootBuilder`] instance.
+        pub fn into_builder(self) -> TaprootBuilder {
+            match self {
+                Self::NotFinalized(builder) | Self::HiddenParts(builder) => builder,
+            }
+        }
+    }
+
+    impl From<Infallible> for IncompleteBuilderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl core::fmt::Display for IncompleteBuilderError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str(match self {
+                Self::NotFinalized(_) =>
+                    "an attempt to construct a Taproot tree from a builder containing incomplete branches",
+                Self::HiddenParts(_) =>
+                    "an attempt to construct a Taproot tree from a builder containing hidden parts",
+            })
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for IncompleteBuilderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::NotFinalized(_) | Self::HiddenParts(_) => None,
+            }
+        }
+    }
+
+    /// Error happening when [`TapTree`] is constructed from a [`NodeInfo`]
+    /// having hidden branches.
     ///
-    /// - If the last bit of the `version` is odd.
-    /// - If the `version` is 0x50 ([`TAPROOT_ANNEX_PREFIX`]).
-    pub fn from_consensus(version: u8) -> Result<Self, InvalidTaprootLeafVersionError> {
-        match version {
-            TAPROOT_LEAF_TAPSCRIPT => Ok(LeafVersion::TapScript),
-            TAPROOT_ANNEX_PREFIX => Err(InvalidTaprootLeafVersionError(TAPROOT_ANNEX_PREFIX)),
-            future => FutureLeafVersion::from_consensus(future).map(LeafVersion::Future),
-        }
+    /// [`TapTree`]: super::TapTree
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum HiddenNodesError {
+        /// Indicates an attempt to construct a Taproot tree from a builder containing hidden parts.
+        HiddenParts(NodeInfo),
     }
 
-    /// Returns the consensus representation of this [`LeafVersion`].
-    pub fn to_consensus(self) -> u8 {
-        match self {
-            LeafVersion::TapScript => TAPROOT_LEAF_TAPSCRIPT,
-            LeafVersion::Future(version) => version.to_consensus(),
-        }
+    impl From<Infallible> for HiddenNodesError {
+        fn from(never: Infallible) -> Self { match never {} }
     }
-}
 
-impl fmt::Display for LeafVersion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (self, f.alternate()) {
-            (LeafVersion::TapScript, true) => f.write_str("tapscript"),
-            (LeafVersion::TapScript, false) => fmt::Display::fmt(&TAPROOT_LEAF_TAPSCRIPT, f),
-            (LeafVersion::Future(version), true) => write!(f, "future_script_{:#02x}", version.0),
-            (LeafVersion::Future(version), false) => fmt::Display::fmt(version, f),
-        }
-    }
-}
-
-impl fmt::LowerHex for LeafVersion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::LowerHex::fmt(&self.to_consensus(), f)
-    }
-}
-impl_to_hex_from_lower_hex!(LeafVersion, |_| 2);
-
-impl fmt::UpperHex for LeafVersion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::UpperHex::fmt(&self.to_consensus(), f)
-    }
-}
-
-/// Serializes [`LeafVersion`] as a `u8` using consensus encoding.
-#[cfg(feature = "serde")]
-impl serde::Serialize for LeafVersion {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_u8(self.to_consensus())
-    }
-}
-
-/// Deserializes [`LeafVersion`] as a `u8` using consensus encoding.
-#[cfg(feature = "serde")]
-impl<'de> serde::Deserialize<'de> for LeafVersion {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct U8Visitor;
-        impl serde::de::Visitor<'_> for U8Visitor {
-            type Value = LeafVersion;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a valid consensus-encoded Taproot leaf version")
-            }
-
-            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                let value = u8::try_from(value).map_err(|_| {
-                    E::invalid_value(
-                        serde::de::Unexpected::Unsigned(value),
-                        &"consensus-encoded leaf version as u8",
-                    )
-                })?;
-                LeafVersion::from_consensus(value).map_err(|_| {
-                    E::invalid_value(
-                        ::serde::de::Unexpected::Unsigned(value as u64),
-                        &"consensus-encoded leaf version as u8",
-                    )
-                })
-            }
-        }
-
-        deserializer.deserialize_u8(U8Visitor)
-    }
-}
-
-/// Detailed error type for Taproot builder.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TaprootBuilderError {
-    /// Merkle tree depth must not be more than 128.
-    InvalidMerkleTreeDepth(InvalidMerkleTreeDepthError),
-    /// Nodes must be added specified in DFS walk order.
-    NodeNotInDfsOrder,
-    /// Two nodes at depth 0 are not allowed.
-    OverCompleteTree,
-    /// Called finalize on a empty tree.
-    EmptyTree,
-}
-
-impl From<Infallible> for TaprootBuilderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for TaprootBuilderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use TaprootBuilderError::*;
-
-        match *self {
-            InvalidMerkleTreeDepth(ref e) => write_err!(f, "invalid Merkle tree depth"; e),
-            NodeNotInDfsOrder => {
-                write!(f, "add_leaf/add_hidden must be called in DFS walk order",)
-            }
-            OverCompleteTree => write!(
-                f,
-                "attempted to create a tree with two nodes at depth 0. There must\
-                only be exactly one node at depth 0",
-            ),
-            EmptyTree => {
-                write!(f, "called finalize on an empty tree")
+    impl HiddenNodesError {
+        /// Converts error into the original incomplete [`NodeInfo`] instance.
+        pub fn into_node_info(self) -> NodeInfo {
+            match self {
+                Self::HiddenParts(node_info) => node_info,
             }
         }
     }
-}
 
-#[cfg(feature = "std")]
-impl std::error::Error for TaprootBuilderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        use TaprootBuilderError::*;
-
-        match *self {
-            InvalidMerkleTreeDepth(ref e) => Some(e),
-            NodeNotInDfsOrder | OverCompleteTree | EmptyTree => None,
+    impl core::fmt::Display for HiddenNodesError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str(match self {
+                Self::HiddenParts(_) =>
+                    "an attempt to construct a Taproot tree from a node_info containing hidden parts",
+            })
         }
     }
-}
 
-impl From<InvalidMerkleTreeDepthError> for TaprootBuilderError {
-    fn from(e: InvalidMerkleTreeDepthError) -> Self { Self::InvalidMerkleTreeDepth(e) }
-}
+    #[cfg(feature = "std")]
+    impl std::error::Error for HiddenNodesError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::HiddenParts(_) => None,
+            }
+        }
+    }
 
-/// Detailed error type for Taproot utilities.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-#[allow(clippy::enum_variant_names)]
-pub enum TaprootError {
+    /// Detailed error type for Taproot builder.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum TaprootBuilderError {
+        /// Merkle tree depth must not be more than 128.
+        InvalidMerkleTreeDepth(InvalidMerkleTreeDepthError),
+        /// Nodes must be added specified in DFS walk order.
+        NodeNotInDfsOrder,
+        /// Two nodes at depth 0 are not allowed.
+        OverCompleteTree,
+        /// Called finalize on an empty tree.
+        EmptyTree,
+    }
+
+    impl From<Infallible> for TaprootBuilderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for TaprootBuilderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::InvalidMerkleTreeDepth(ref e) =>
+                    write_err!(f, "invalid Merkle tree depth"; e),
+                Self::NodeNotInDfsOrder => {
+                    write!(f, "add_leaf/add_hidden must be called in DFS walk order",)
+                }
+                Self::OverCompleteTree => write!(
+                    f,
+                    "attempted to create a tree with two nodes at depth 0. There must\
+                    only be exactly one node at depth 0",
+                ),
+                Self::EmptyTree => {
+                    write!(f, "called finalize on an empty tree")
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for TaprootBuilderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::InvalidMerkleTreeDepth(ref e) => Some(e),
+                Self::NodeNotInDfsOrder | Self::OverCompleteTree | Self::EmptyTree => None,
+            }
+        }
+    }
+
+    impl From<InvalidMerkleTreeDepthError> for TaprootBuilderError {
+        fn from(e: InvalidMerkleTreeDepthError) -> Self { Self::InvalidMerkleTreeDepth(e) }
+    }
+
+    /// Detailed error type for Taproot utilities.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    #[allow(clippy::enum_variant_names)]
+    pub enum TaprootError {
+        /// Proof size must be a multiple of 32.
+        InvalidMerkleBranchSize(InvalidMerkleBranchSizeError),
+        /// Merkle tree depth must not be more than 128.
+        InvalidMerkleTreeDepth(InvalidMerkleTreeDepthError),
+        /// The last bit of tapleaf version must be zero.
+        InvalidTaprootLeafVersion(InvalidTaprootLeafVersionError),
+        /// Invalid control block size.
+        InvalidControlBlockSize(InvalidControlBlockSizeError),
+        /// Invalid Taproot internal key.
+        InvalidInternalKey(ParseXOnlyPublicKeyError),
+        /// Invalid control block hex
+        InvalidControlBlockHex(DecodeVariableLengthBytesError),
+    }
+
+    impl From<Infallible> for TaprootError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for TaprootError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::InvalidMerkleBranchSize(ref e) =>
+                    write_err!(f, "invalid Merkle branch size"; e),
+                Self::InvalidMerkleTreeDepth(ref e) =>
+                    write_err!(f, "invalid Merkle tree depth"; e),
+                Self::InvalidTaprootLeafVersion(ref e) =>
+                    write_err!(f, "invalid Taproot leaf version"; e),
+                Self::InvalidControlBlockSize(ref e) =>
+                    write_err!(f, "invalid control block size"; e),
+                Self::InvalidControlBlockHex(ref e) =>
+                    write_err!(f, "invalid control block hex"; e),
+                Self::InvalidInternalKey(ref e) => write_err!(f, "invalid internal x-only key"; e),
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for TaprootError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::InvalidInternalKey(e) => Some(e),
+                Self::InvalidTaprootLeafVersion(ref e) => Some(e),
+                Self::InvalidMerkleTreeDepth(ref e) => Some(e),
+                Self::InvalidControlBlockHex(ref e) => Some(e),
+                Self::InvalidMerkleBranchSize(_) | Self::InvalidControlBlockSize(_) => None,
+            }
+        }
+    }
+
+    impl From<InvalidMerkleBranchSizeError> for TaprootError {
+        fn from(e: InvalidMerkleBranchSizeError) -> Self { Self::InvalidMerkleBranchSize(e) }
+    }
+
+    impl From<InvalidMerkleTreeDepthError> for TaprootError {
+        fn from(e: InvalidMerkleTreeDepthError) -> Self { Self::InvalidMerkleTreeDepth(e) }
+    }
+
+    impl From<InvalidTaprootLeafVersionError> for TaprootError {
+        fn from(e: InvalidTaprootLeafVersionError) -> Self { Self::InvalidTaprootLeafVersion(e) }
+    }
+
+    impl From<InvalidControlBlockSizeError> for TaprootError {
+        fn from(e: InvalidControlBlockSizeError) -> Self { Self::InvalidControlBlockSize(e) }
+    }
+
     /// Proof size must be a multiple of 32.
-    InvalidMerkleBranchSize(InvalidMerkleBranchSizeError),
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct InvalidMerkleBranchSizeError(pub(super) usize);
+
+    impl InvalidMerkleBranchSizeError {
+        /// Accessor for the invalid merkle branch size.
+        pub fn invalid_merkle_branch_size(&self) -> usize { self.0 }
+    }
+
+    impl From<Infallible> for InvalidMerkleBranchSizeError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for InvalidMerkleBranchSizeError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "Merkle branch size({}) must be a multiple of {}",
+                self.0, TAPROOT_CONTROL_NODE_SIZE
+            )
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for InvalidMerkleBranchSizeError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            let Self(_) = self;
+            None
+        }
+    }
+
     /// Merkle tree depth must not be more than 128.
-    InvalidMerkleTreeDepth(InvalidMerkleTreeDepthError),
-    /// The last bit of tapleaf version must be zero.
-    InvalidTaprootLeafVersion(InvalidTaprootLeafVersionError),
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct InvalidMerkleTreeDepthError(pub(super) usize);
+
+    impl InvalidMerkleTreeDepthError {
+        /// Accessor for the invalid merkle tree depth.
+        pub fn invalid_merkle_tree_depth(&self) -> usize { self.0 }
+    }
+
+    impl From<Infallible> for InvalidMerkleTreeDepthError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for InvalidMerkleTreeDepthError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "Merkle tree depth({}) must be less than {}",
+                self.0, TAPROOT_CONTROL_MAX_NODE_COUNT
+            )
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for InvalidMerkleTreeDepthError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            let Self(_) = self;
+            None
+        }
+    }
+
     /// Invalid control block size.
-    InvalidControlBlockSize(InvalidControlBlockSizeError),
-    /// Invalid Taproot internal key.
-    InvalidInternalKey(ParseXOnlyPublicKeyError),
-    /// Invalid control block hex
-    InvalidControlBlockHex(HexToBytesError),
-}
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct InvalidControlBlockSizeError(pub(super) usize);
 
-impl From<Infallible> for TaprootError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
+    impl InvalidControlBlockSizeError {
+        /// Accessor for the invalid control block size.
+        pub fn invalid_control_block_size(&self) -> usize { self.0 }
+    }
 
-impl fmt::Display for TaprootError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use TaprootError::*;
+    impl From<Infallible> for InvalidControlBlockSizeError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
 
-        match *self {
-            InvalidMerkleBranchSize(ref e) => write_err!(f, "invalid Merkle branch size"; e),
-            InvalidMerkleTreeDepth(ref e) => write_err!(f, "invalid Merkle tree depth"; e),
-            InvalidTaprootLeafVersion(ref e) => write_err!(f, "invalid Taproot leaf version"; e),
-            InvalidControlBlockSize(ref e) => write_err!(f, "invalid control block size"; e),
-            InvalidControlBlockHex(ref e) => write_err!(f, "invalid control block hex"; e),
-            InvalidInternalKey(ref e) => write_err!(f, "invalid internal x-only key"; e),
+    impl fmt::Display for InvalidControlBlockSizeError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "Control Block size({}) must be of the form 33 + 32*m where 0 <= m <= {} ",
+                self.0, TAPROOT_CONTROL_MAX_NODE_COUNT
+            )
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for InvalidControlBlockSizeError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            let Self(_) = self;
+            None
         }
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for TaprootError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        use TaprootError::*;
+#[cfg(feature = "arbitrary")]
+impl<'a> Arbitrary<'a> for LeafNode {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(Self { leaf: u.arbitrary()?, merkle_branch: u.arbitrary()? })
+    }
+}
 
-        match self {
-            InvalidInternalKey(e) => Some(e),
-            InvalidTaprootLeafVersion(ref e) => Some(e),
-            InvalidMerkleTreeDepth(ref e) => Some(e),
-            InvalidControlBlockHex(ref e) => Some(e),
-            InvalidMerkleBranchSize(_) | InvalidControlBlockSize(_) => None,
+#[cfg(feature = "arbitrary")]
+impl<'a> Arbitrary<'a> for NodeInfo {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(Self { hash: u.arbitrary()?, leaves: u.arbitrary()?, has_hidden_nodes: u.arbitrary()? })
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+impl<'a> Arbitrary<'a> for TapLeaf {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        match bool::arbitrary(u)? {
+            true => Ok(Self::Hidden(u.arbitrary()?)),
+            false => Ok(Self::Script(u.arbitrary()?, u.arbitrary()?)),
         }
     }
 }
 
-impl From<InvalidMerkleBranchSizeError> for TaprootError {
-    fn from(e: InvalidMerkleBranchSizeError) -> Self { Self::InvalidMerkleBranchSize(e) }
-}
-
-impl From<InvalidMerkleTreeDepthError> for TaprootError {
-    fn from(e: InvalidMerkleTreeDepthError) -> Self { Self::InvalidMerkleTreeDepth(e) }
-}
-
-impl From<InvalidTaprootLeafVersionError> for TaprootError {
-    fn from(e: InvalidTaprootLeafVersionError) -> Self { Self::InvalidTaprootLeafVersion(e) }
-}
-
-impl From<InvalidControlBlockSizeError> for TaprootError {
-    fn from(e: InvalidControlBlockSizeError) -> Self { Self::InvalidControlBlockSize(e) }
-}
-
-/// Proof size must be a multiple of 32.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvalidMerkleBranchSizeError(usize);
-
-impl InvalidMerkleBranchSizeError {
-    /// Accessor for the invalid merkle branch size.
-    pub fn invalid_merkle_branch_size(&self) -> usize { self.0 }
-}
-
-impl From<Infallible> for InvalidMerkleBranchSizeError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for InvalidMerkleBranchSizeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Merkle branch size({}) must be a multiple of {}",
-            self.0, TAPROOT_CONTROL_NODE_SIZE
-        )
+#[cfg(feature = "arbitrary")]
+impl<'a> Arbitrary<'a> for TapTree {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        let node_info = NodeInfo::arbitrary(u)?;
+        Ok(Self(node_info))
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for InvalidMerkleBranchSizeError {}
-
-/// Merkle tree depth must not be more than 128.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvalidMerkleTreeDepthError(usize);
-
-impl InvalidMerkleTreeDepthError {
-    /// Accessor for the invalid merkle tree depth.
-    pub fn invalid_merkle_tree_depth(&self) -> usize { self.0 }
-}
-
-impl From<Infallible> for InvalidMerkleTreeDepthError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for InvalidMerkleTreeDepthError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Merkle tree depth({}) must be less than {}",
-            self.0, TAPROOT_CONTROL_MAX_NODE_COUNT
-        )
+#[cfg(feature = "arbitrary")]
+impl<'a> Arbitrary<'a> for ControlBlock {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(Self::decode(u.arbitrary()?).map_err(|_| arbitrary::Error::IncorrectFormat)?)
     }
 }
-
-#[cfg(feature = "std")]
-impl std::error::Error for InvalidMerkleTreeDepthError {}
-
-/// The last bit of tapleaf version must be zero.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvalidTaprootLeafVersionError(u8);
-
-impl InvalidTaprootLeafVersionError {
-    /// Accessor for the invalid leaf version.
-    pub fn invalid_leaf_version(&self) -> u8 { self.0 }
-}
-
-impl From<Infallible> for InvalidTaprootLeafVersionError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for InvalidTaprootLeafVersionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "leaf version({}) must have the least significant bit 0", self.0)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for InvalidTaprootLeafVersionError {}
-
-/// Invalid control block size.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvalidControlBlockSizeError(usize);
-
-impl InvalidControlBlockSizeError {
-    /// Accessor for the invalid control block size.
-    pub fn invalid_control_block_size(&self) -> usize { self.0 }
-}
-
-impl From<Infallible> for InvalidControlBlockSizeError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for InvalidControlBlockSizeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Control Block size({}) must be of the form 33 + 32*m where  0 <= m <= {} ",
-            self.0, TAPROOT_CONTROL_MAX_NODE_COUNT
-        )
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for InvalidControlBlockSizeError {}
 
 #[cfg(test)]
 mod test {
+    use alloc::string::ToString;
+
     use hashes::sha256;
     use hex::DisplayHex;
-    use secp256k1::VerifyOnly;
 
     use super::*;
-    use crate::script::ScriptBufExt as _;
     use crate::sighash::TapSighashTag;
-    use crate::{Address, KnownHrp};
     extern crate serde_json;
 
     #[cfg(feature = "serde")]
@@ -1780,93 +1582,77 @@ mod test {
         );
     }
 
-    fn _verify_tap_commitments(
-        secp: &Secp256k1<VerifyOnly>,
-        out_spk_hex: &str,
-        script_hex: &str,
-        control_block_hex: &str,
-    ) {
+    fn _verify_tap_commitments(out_spk_hex: &str, script_hex: &str, control_block_hex: &str) {
         let out_pk = out_spk_hex[4..].parse::<XOnlyPublicKey>().unwrap();
         let out_pk = TweakedPublicKey::dangerous_assume_tweaked(out_pk);
-        let script = ScriptBuf::from_hex_no_length_prefix(script_hex).unwrap();
+        let script = TapScriptBuf::from_hex_no_length_prefix(script_hex).unwrap();
         let control_block = ControlBlock::from_hex(control_block_hex).unwrap();
         assert_eq!(control_block_hex, control_block.serialize().to_lower_hex_string());
-        assert!(control_block.verify_taproot_commitment(
-            secp,
-            out_pk.to_x_only_public_key(),
-            &script
-        ));
+        assert!(control_block.verify_taproot_commitment(out_pk.to_x_only_public_key(), &script));
     }
 
     #[test]
     fn control_block_verify() {
-        let secp = Secp256k1::verification_only();
         // test vectors obtained from printing values in feature_taproot.py from Bitcoin Core
-        _verify_tap_commitments(&secp, "51205dc8e62b15e0ebdf44751676be35ba32eed2e84608b290d4061bbff136cd7ba9", "6a", "c1a9d6f66cd4b25004f526bfa873e56942f98e8e492bd79ed6532b966104817c2bda584e7d32612381cf88edc1c02e28a296e807c16ad22f591ee113946e48a71e0641e660d1e5392fb79d64838c2b84faf04b7f5f283c9d8bf83e39e177b64372a0cd22eeab7e093873e851e247714eff762d8a30be699ba4456cfe6491b282e193a071350ae099005a5950d74f73ba13077a57bc478007fb0e4d1099ce9cf3d4");
-        _verify_tap_commitments(&secp, "5120e208c869c40d8827101c5ad3238018de0f3f5183d77a0c53d18ac28ddcbcd8ad", "f4", "c0a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f40090ab1f4890d51115998242ebce636efb9ede1b516d9eb8952dc1068e0335306199aaf103cceb41d9bc37ec231aca89b984b5fd3c65977ce764d51033ac65adb4da14e029b1e154a85bfd9139e7aa2720b6070a4ceba8264ca61d5d3ac27aceb9ef4b54cd43c2d1fd5e11b5c2e93cf29b91ea3dc5b832201f02f7473a28c63246");
+        _verify_tap_commitments("51205dc8e62b15e0ebdf44751676be35ba32eed2e84608b290d4061bbff136cd7ba9", "6a", "c1a9d6f66cd4b25004f526bfa873e56942f98e8e492bd79ed6532b966104817c2bda584e7d32612381cf88edc1c02e28a296e807c16ad22f591ee113946e48a71e0641e660d1e5392fb79d64838c2b84faf04b7f5f283c9d8bf83e39e177b64372a0cd22eeab7e093873e851e247714eff762d8a30be699ba4456cfe6491b282e193a071350ae099005a5950d74f73ba13077a57bc478007fb0e4d1099ce9cf3d4");
+        _verify_tap_commitments("5120e208c869c40d8827101c5ad3238018de0f3f5183d77a0c53d18ac28ddcbcd8ad", "f4", "c0a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f40090ab1f4890d51115998242ebce636efb9ede1b516d9eb8952dc1068e0335306199aaf103cceb41d9bc37ec231aca89b984b5fd3c65977ce764d51033ac65adb4da14e029b1e154a85bfd9139e7aa2720b6070a4ceba8264ca61d5d3ac27aceb9ef4b54cd43c2d1fd5e11b5c2e93cf29b91ea3dc5b832201f02f7473a28c63246");
         _verify_tap_commitments(
-            &secp,
             "5120567666e7df90e0450bb608e17c01ed3fbcfa5355a5f8273e34e583bfaa70ce09",
             "203455139bf238a3067bd72ed77e0ab8db590330f55ed58dba7366b53bf4734279ac",
             "c1a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400",
         );
-        _verify_tap_commitments(&secp, "5120580a19e47269414a55eb86d5d0c6c9b371455d9fd2154412a57dec840df99fe1", "6a", "bca0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f40042ba1bd1c63c03ccff60d4c4d53a653f87909eb3358e7fa45c9d805231fb08c933e1f4e0f9d17f591df1419df7d5b7eb5f744f404c5ef9ecdb1b89b18cafa3a816d8b5dba3205f9a9c05f866d91f40d2793a7586d502cb42f46c7a11f66ad4aa");
-        _verify_tap_commitments(&secp, "5120228b94a4806254a38d6efa8a134c28ebc89546209559dfe40b2b0493bafacc5b", "6a50", "c0a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4009c9aed3dfd11ab0e78bf87ef3bf296269dc4b0f7712140386d6980992bab4b45");
+        _verify_tap_commitments("5120580a19e47269414a55eb86d5d0c6c9b371455d9fd2154412a57dec840df99fe1", "6a", "bca0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f40042ba1bd1c63c03ccff60d4c4d53a653f87909eb3358e7fa45c9d805231fb08c933e1f4e0f9d17f591df1419df7d5b7eb5f744f404c5ef9ecdb1b89b18cafa3a816d8b5dba3205f9a9c05f866d91f40d2793a7586d502cb42f46c7a11f66ad4aa");
+        _verify_tap_commitments("5120228b94a4806254a38d6efa8a134c28ebc89546209559dfe40b2b0493bafacc5b", "6a50", "c0a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4009c9aed3dfd11ab0e78bf87ef3bf296269dc4b0f7712140386d6980992bab4b45");
         _verify_tap_commitments(
-            &secp,
             "5120567666e7df90e0450bb608e17c01ed3fbcfa5355a5f8273e34e583bfaa70ce09",
             "203455139bf238a3067bd72ed77e0ab8db590330f55ed58dba7366b53bf4734279ac",
             "c1a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400",
         );
         _verify_tap_commitments(
-            &secp,
             "5120b0a79103c31fe51eea61d2873bad8a25a310da319d7e7a85f825fa7a00ea3f85",
             "203455139bf238a3067bd72ed77e0ab8db590330f55ed58dba7366b53bf4734279ad51",
             "c1a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400",
         );
-        _verify_tap_commitments(&secp, "5120f2f62e854a0012aeba78cd4ba4a0832447a5262d4c6eb4f1c95c7914b536fc6c", "6a86", "c1a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4009ad3d30479f0689dbdf59a6b840d60ad485b2effbed1825a75ce19a44e460e09056f60ea686d79cfa4fb79f197b2e905ac857a983be4a5a41a4873e865aa950780c0237de279dc063e67deec46ef8e1bc351bf12c4d67a6d568001faf097e797e6ee620f53cfe0f8acaddf2063c39c3577853bb46d61ffcba5a024c3e1216837");
-        _verify_tap_commitments(&secp, "51202a4772070b49bae68b44315032cdbf9c40c7c2f896781b32b931b73dbfb26d7e", "6af8", "c0a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4006f183944a14618fc7fe9ceade0f58e43a19d3c3b179ea6c43c29616413b6971c99aaf103cceb41d9bc37ec231aca89b984b5fd3c65977ce764d51033ac65adb4c3462adec78cd04f3cc156bdadec50def99feae0dc6a23664e8a2b0d42d6ca9eb968dfdf46c23af642b2688351904e0a0630e71ffac5bcaba33b9b2c8a7495ec");
-        _verify_tap_commitments(&secp, "5120a32b0b8cfafe0f0f8d5870030ba4d19a8725ad345cb3c8420f86ac4e0dff6207", "4c", "e8a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400615da7ac8d078e5fc7f4690fc2127ba40f0f97cc070ade5b3a7919783d91ef3f13734aab908ae998e57848a01268fe8217d70bc3ee8ea8ceae158ae964a4b5f3af20b50d7019bf47fde210eee5c52f1cfe71cfca78f2d3e7c1fd828c80351525");
+        _verify_tap_commitments("5120f2f62e854a0012aeba78cd4ba4a0832447a5262d4c6eb4f1c95c7914b536fc6c", "6a86", "c1a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4009ad3d30479f0689dbdf59a6b840d60ad485b2effbed1825a75ce19a44e460e09056f60ea686d79cfa4fb79f197b2e905ac857a983be4a5a41a4873e865aa950780c0237de279dc063e67deec46ef8e1bc351bf12c4d67a6d568001faf097e797e6ee620f53cfe0f8acaddf2063c39c3577853bb46d61ffcba5a024c3e1216837");
+        _verify_tap_commitments("51202a4772070b49bae68b44315032cdbf9c40c7c2f896781b32b931b73dbfb26d7e", "6af8", "c0a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4006f183944a14618fc7fe9ceade0f58e43a19d3c3b179ea6c43c29616413b6971c99aaf103cceb41d9bc37ec231aca89b984b5fd3c65977ce764d51033ac65adb4c3462adec78cd04f3cc156bdadec50def99feae0dc6a23664e8a2b0d42d6ca9eb968dfdf46c23af642b2688351904e0a0630e71ffac5bcaba33b9b2c8a7495ec");
+        _verify_tap_commitments("5120a32b0b8cfafe0f0f8d5870030ba4d19a8725ad345cb3c8420f86ac4e0dff6207", "4c", "e8a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400615da7ac8d078e5fc7f4690fc2127ba40f0f97cc070ade5b3a7919783d91ef3f13734aab908ae998e57848a01268fe8217d70bc3ee8ea8ceae158ae964a4b5f3af20b50d7019bf47fde210eee5c52f1cfe71cfca78f2d3e7c1fd828c80351525");
         _verify_tap_commitments(
-            &secp,
             "5120b0a79103c31fe51eea61d2873bad8a25a310da319d7e7a85f825fa7a00ea3f85",
             "203455139bf238a3067bd72ed77e0ab8db590330f55ed58dba7366b53bf4734279ad51",
             "c1a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400",
         );
-        _verify_tap_commitments(&secp, "51208678459f1fa0f80e9b89b8ffdcaf46a022bdf60aa45f1fed9a96145edf4ec400", "6a50", "c0a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4001eff29e1a89e650076b8d3c56302881d09c9df215774ed99993aaed14acd6615");
-        _verify_tap_commitments(&secp, "5120017316303aed02bcdec424c851c9eacbe192b013139bd9634c4e19b3475b06e1", "61", "02a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f40050462265ca552b23cbb4fe021b474313c8cb87d4a18b3f7bdbeb2b418279ba31fc6509d829cd42336f563363cb3538d78758e0876c71e13012eb2b656eb0edb051a2420a840d5c8c6c762abc7410af2c311f606b20ca2ace56a8139f84b1379a");
-        _verify_tap_commitments(&secp, "5120896d4d5d2236e86c6e9320e86d1a7822e652907cbd508360e8c71aefc127c77d", "61", "14a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4001ab0e9d9a4858a0e69605fe9c5a42d739fbe26fa79650e7074f462b02645f7ea1c91802b298cd91e6b5af57c6a013d93397cd2ecbd5569382cc27becf44ff4fff8960b20f846160c159c58350f6b6072cf1b3daa5185b7a42524fb72cbc252576ae46732b8e31ac24bfa7d72f4c3713e8696f99d8ac6c07e4c820a03f249f144");
-        _verify_tap_commitments(&secp, "512093c7378d96518a75448821c4f7c8f4bae7ce60f804d03d1f0628dd5dd0f5de51", "04ffffffff203455139bf238a3067bd72ed77e0ab8db590330f55ed58dba7366b53bf4734279ba04feffffff87ab", "c1a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400c9a5cd1f6c8a81f5648e39f9810591df1c9a8f1fe97c92e03ecd7c0c016c951983e05473c6e8238cb4c780ea2ce62552b2a3eee068ceffc00517cd7b97e10dad");
-        _verify_tap_commitments(&secp, "5120b28d75a7179de6feb66b8bb0bfa2b2c739d1a41cf7366a1b393804a844db8a28", "61", "c4a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400eebc95ded88fb8050094e8dfa958c3be0894eaff0fafae678206b26918d8d7ac47039d40fe34d04b4155df7f1be7f2a49253c7e87812ea9e569e683ac27459e652d6503aa32d64734d00adfee8798b2eed28858abf3bd038e8fa58eb7df4a2d9");
-        _verify_tap_commitments(&secp, "512043e4aa733fc6f43c78a31c2b3c192623acf5cc8c01199ebcc4de88067baca83e", "bd4c", "c1a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4003f7be6f8848b5bddf332c4d7bd83077f73701e2479f70e02b5730e841234d082b8b41ebea96ffd937715d9faeaa6895e6ef3b22919c554b75df12b3371d328023e443d1df50634ecc1cd169803a1e546f0d44304d8fc5056c408e597fed469b8437d6660eaad3cf72e35ba6e5ff7ddd5e293c1e7e813c871df4f46508e9946ec");
-        _verify_tap_commitments(&secp, "5120ee9aecb28f5f35ce1f8b5ec80275ac0f81bca4a21b29b4632fb4bcbef8823e6a", "2021a5981b13be29c9d4ea179ea44a8b773ea8c02d68f6f6eefd98de20d4bd055fac", "c13359c284c196b6e80f0cf1d93b6a397cf7ee722f0427b705bd954b88ada8838bd2622fd0e104fc50aa763b43c6a792d7d117029983abd687223b4344a9402c618bba7f5fc3fa8a57491f6842acde88c1e675ca35caea3b1a69ee2c2d9b10f615");
-        _verify_tap_commitments(&secp, "5120885274df2252b44764dcef53c21f21154e8488b7e79fafbc96b9ebb22ad0200d", "6a50", "c1a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4000793597254158918e3369507f2d6fdbef17d18b1028bbb0719450ded0f42c58f");
-        _verify_tap_commitments(&secp, "512066f6f6f91d47674d198a28388e1eb05ec24e6ddbba10f16396b1a80c08675121", "6a50", "c1a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400fe92aff70a2e8e2a4f34a913b99612468a41e0f8ecaff9a729a173d11013c27e");
-        _verify_tap_commitments(&secp, "5120868ed9307bd4637491ff03e3aa2c216a08fe213cac8b6cedbb9ab31dbfa6512c", "61", "a2a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400da584e7d32612381cf88edc1c02e28a296e807c16ad22f591ee113946e48a71e46c7eccffefd2d573ec014130e508f0c9963ccebd7830409f7b1b1301725e9fa759d4ef857ec8e0bb42d6d31609d3c7e77de3bfa28c38f93393a6ddbabe819ec560ed4f061fbe742a5fd2a648d5209469420434c8753da3fa7067cc2bb4c172a");
-        _verify_tap_commitments(&secp, "5120c1a00a9baa82888fd7d30291135a7eaa9e9966a5f16db2b10460572f8b108d8d", "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", "5ba0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4007960d7b37dd1361aee34510e77acb4d27ddca17648a17e28475032538c1eb500f5a747f2c0893f79fe153ae918ac3d696de9322aa679aae62051ff5ed83aa502b338bd907346abd4cd9cf06117cb35d55a5a8dd950843522f8de7b5c7fba1804c38b0778d3d76b383f6db6fdf9d6e770da8fffbfa5152c0b8b38129885bcdee6");
-        _verify_tap_commitments(&secp, "5120bb9abeff7286b76dfc61800c548fe2621ff47506e47201a85c543b4a9a96fead", "75203455139bf238a3067bd72ed77e0ab8db590330f55ed58dba7366b53bf47342796ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6eadac", "c0a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4003eb5cdc419e0a6a800f34583ce750f387be34879c26f4230991bd61da743ad9d34d288e79397b709ac22ad8cc57645d593af3e15b97a876362117177ab2519c000000000000000000000000000000000000000000000000000000000000000007160c3a48c8b17bc3aeaf01db9e0a96ac47a5a9fa329e046856e7765e89c8a93ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff07feb9aa7cd72c78e66a85414cd19289f8b0ab1415013dc2a007666aa9248ec1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001fccc8bea662a9442a94f7ba0643c1d7ee7cc689f3b3506b7c8c99fd3f3b3d7772972dcdf2550cf95b65098aea67f72fef10abdcf1cef9815af8f4c4644b060e0000000000000000000000000000000000000000000000000000000000000000");
-        _verify_tap_commitments(&secp, "5120afddc189ea51094b4cbf463806792e9c8b35dfdc5e01228c78376380d0046b00", "4d09024747703eb9f759ce5ecd839109fecc40974ab16f5173ea390daaa5a78f7abe898165c90990062af998c5dc7989818393158a2c62b7ece727e7f5400d2efd33db8732599f6d1dce6b5b68d2d47317f2de6c9df118f61227f98453225036618aaf058140f2415d134fa69ba041c724ad81387f8c568d12ddc49eb32a71532096181b3f85fd465b8e9a176bb19f45c070baad47a2cc4505414b88c31cb5b0a192b2d2d56c404a37070b04d42c875c4ac351224f5b254f9ad0b820f43cad292d6565f796bf083173e14723f1e543c85a61689ddd5cb6666b240c15c38ce3320bf0c3be9e0322e5ef72366c294d3a2d7e8b8e7db875e7ae814537554f10b91c72b8b413e026bd5d5e917de4b54fa8f43f38771a7f242aa32dcb7ca1b0588dbf54af7ab9455047fbb894cdfdd242166db784276430eb47d4df092a6b8cb160eb982fe7d14a44283bdb4a9861ca65c06fd8b2546cfbfe38bc77f527de1b9bfd2c95a3e283b7b1d1d2b2fa291256a90a7003aefcef47ceabf113865a494af43e96a38b0b00919855eb7722ea2363e0ddfc9c51c08631d01e2a2d56e786b4ff6f1e5d415facc9c2619c285d9ad43001878294157cb025f639fb954271fd1d6173f6bc16535672f6abdd72b0284b4ff3eaf5b7247719d7c39365622610efae6562bef6e08a0b370fba75bb04dbdb90a482d8417e057f8bd021ea6ac32d0d48b08be9f77833b11e5e739960c9837d7583", "c0a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400ff698adfda0327f188e2ee35f7aecc0f90c9138a350d450648d968c2b5dd7ef94ddd3ec418dc0d03ee4956feb708d838ed2b20e5a193465a6a1467fd3054e1ea141ea4c4c503a6271e19a090e2a69a24282e3be04c4f98720f7a0eb274d9693d13a8e3c139aa625fa2aefd09854570527f9ac545bda1b689719f5cb715612c07");
-        _verify_tap_commitments(&secp, "5120afddc189ea51094b4cbf463806792e9c8b35dfdc5e01228c78376380d0046b00", "83", "c0a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4007388cda01113397d4cd00bcfbd08fd68c3cfe3a42cbfe3a7651c1d5e6dacf1ad99aaf103cceb41d9bc37ec231aca89b984b5fd3c65977ce764d51033ac65adb4b59764bec92507e4a4c3f01a06f05980163ca10f1c549bfe01f85fa4f109a1295e607f5ed9f1008048474de336f11f67a1fbf2012f58944dede0ab19a3ca81f5");
-        _verify_tap_commitments(&secp, "512093c7378d96518a75448821c4f7c8f4bae7ce60f804d03d1f0628dd5dd0f5de51", "04ffffffff203455139bf238a3067bd72ed77e0ab8db590330f55ed58dba7366b53bf4734279ba04feffffff87ab", "c1a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400c9a5cd1f6c8a81f5648e39f9810591df1c9a8f1fe97c92e03ecd7c0c016c951983e05473c6e8238cb4c780ea2ce62552b2a3eee068ceffc00517cd7b97e10dad");
+        _verify_tap_commitments("51208678459f1fa0f80e9b89b8ffdcaf46a022bdf60aa45f1fed9a96145edf4ec400", "6a50", "c0a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4001eff29e1a89e650076b8d3c56302881d09c9df215774ed99993aaed14acd6615");
+        _verify_tap_commitments("5120017316303aed02bcdec424c851c9eacbe192b013139bd9634c4e19b3475b06e1", "61", "02a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f40050462265ca552b23cbb4fe021b474313c8cb87d4a18b3f7bdbeb2b418279ba31fc6509d829cd42336f563363cb3538d78758e0876c71e13012eb2b656eb0edb051a2420a840d5c8c6c762abc7410af2c311f606b20ca2ace56a8139f84b1379a");
+        _verify_tap_commitments("5120896d4d5d2236e86c6e9320e86d1a7822e652907cbd508360e8c71aefc127c77d", "61", "14a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4001ab0e9d9a4858a0e69605fe9c5a42d739fbe26fa79650e7074f462b02645f7ea1c91802b298cd91e6b5af57c6a013d93397cd2ecbd5569382cc27becf44ff4fff8960b20f846160c159c58350f6b6072cf1b3daa5185b7a42524fb72cbc252576ae46732b8e31ac24bfa7d72f4c3713e8696f99d8ac6c07e4c820a03f249f144");
+        _verify_tap_commitments("512093c7378d96518a75448821c4f7c8f4bae7ce60f804d03d1f0628dd5dd0f5de51", "04ffffffff203455139bf238a3067bd72ed77e0ab8db590330f55ed58dba7366b53bf4734279ba04feffffff87ab", "c1a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400c9a5cd1f6c8a81f5648e39f9810591df1c9a8f1fe97c92e03ecd7c0c016c951983e05473c6e8238cb4c780ea2ce62552b2a3eee068ceffc00517cd7b97e10dad");
+        _verify_tap_commitments("5120b28d75a7179de6feb66b8bb0bfa2b2c739d1a41cf7366a1b393804a844db8a28", "61", "c4a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400eebc95ded88fb8050094e8dfa958c3be0894eaff0fafae678206b26918d8d7ac47039d40fe34d04b4155df7f1be7f2a49253c7e87812ea9e569e683ac27459e652d6503aa32d64734d00adfee8798b2eed28858abf3bd038e8fa58eb7df4a2d9");
+        _verify_tap_commitments("512043e4aa733fc6f43c78a31c2b3c192623acf5cc8c01199ebcc4de88067baca83e", "bd4c", "c1a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4003f7be6f8848b5bddf332c4d7bd83077f73701e2479f70e02b5730e841234d082b8b41ebea96ffd937715d9faeaa6895e6ef3b22919c554b75df12b3371d328023e443d1df50634ecc1cd169803a1e546f0d44304d8fc5056c408e597fed469b8437d6660eaad3cf72e35ba6e5ff7ddd5e293c1e7e813c871df4f46508e9946ec");
+        _verify_tap_commitments("5120ee9aecb28f5f35ce1f8b5ec80275ac0f81bca4a21b29b4632fb4bcbef8823e6a", "2021a5981b13be29c9d4ea179ea44a8b773ea8c02d68f6f6eefd98de20d4bd055fac", "c13359c284c196b6e80f0cf1d93b6a397cf7ee722f0427b705bd954b88ada8838bd2622fd0e104fc50aa763b43c6a792d7d117029983abd687223b4344a9402c618bba7f5fc3fa8a57491f6842acde88c1e675ca35caea3b1a69ee2c2d9b10f615");
+        _verify_tap_commitments("5120885274df2252b44764dcef53c21f21154e8488b7e79fafbc96b9ebb22ad0200d", "6a50", "c1a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4000793597254158918e3369507f2d6fdbef17d18b1028bbb0719450ded0f42c58f");
+        _verify_tap_commitments("512066f6f6f91d47674d198a28388e1eb05ec24e6ddbba10f16396b1a80c08675121", "6a50", "c1a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400fe92aff70a2e8e2a4f34a913b99612468a41e0f8ecaff9a729a173d11013c27e");
+        _verify_tap_commitments("5120868ed9307bd4637491ff03e3aa2c216a08fe213cac8b6cedbb9ab31dbfa6512c", "61", "a2a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400da584e7d32612381cf88edc1c02e28a296e807c16ad22f591ee113946e48a71e46c7eccffefd2d573ec014130e508f0c9963ccebd7830409f7b1b1301725e9fa759d4ef857ec8e0bb42d6d31609d3c7e77de3bfa28c38f93393a6ddbabe819ec560ed4f061fbe742a5fd2a648d5209469420434c8753da3fa7067cc2bb4c172a");
+        _verify_tap_commitments("5120c1a00a9baa82888fd7d30291135a7eaa9e9966a5f16db2b10460572f8b108d8d", "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", "5ba0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4007960d7b37dd1361aee34510e77acb4d27ddca17648a17e28475032538c1eb500f5a747f2c0893f79fe153ae918ac3d696de9322aa679aae62051ff5ed83aa502b338bd907346abd4cd9cf06117cb35d55a5a8dd950843522f8de7b5c7fba1804c38b0778d3d76b383f6db6fdf9d6e770da8fffbfa5152c0b8b38129885bcdee6");
+        _verify_tap_commitments("5120bb9abeff7286b76dfc61800c548fe2621ff47506e47201a85c543b4a9a96fead", "75203455139bf238a3067bd72ed77e0ab8db590330f55ed58dba7366b53bf47342796ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6eadac", "c0a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4003eb5cdc419e0a6a800f34583ce750f387be34879c26f4230991bd61da743ad9d34d288e79397b709ac22ad8cc57645d593af3e15b97a876362117177ab2519c000000000000000000000000000000000000000000000000000000000000000007160c3a48c8b17bc3aeaf01db9e0a96ac47a5a9fa329e046856e7765e89c8a93ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff07feb9aa7cd72c78e66a85414cd19289f8b0ab1415013dc2a007666aa9248ec1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001fccc8bea662a9442a94f7ba0643c1d7ee7cc689f3b3506b7c8c99fd3f3b3d7772972dcdf2550cf95b65098aea67f72fef10abdcf1cef9815af8f4c4644b060e0000000000000000000000000000000000000000000000000000000000000000");
+        _verify_tap_commitments("5120afddc189ea51094b4cbf463806792e9c8b35dfdc5e01228c78376380d0046b00", "4d09024747703eb9f759ce5ecd839109fecc40974ab16f5173ea390daaa5a78f7abe898165c90990062af998c5dc7989818393158a2c62b7ece727e7f5400d2efd33db8732599f6d1dce6b5b68d2d47317f2de6c9df118f61227f98453225036618aaf058140f2415d134fa69ba041c724ad81387f8c568d12ddc49eb32a71532096181b3f85fd465b8e9a176bb19f45c070baad47a2cc4505414b88c31cb5b0a192b2d2d56c404a37070b04d42c875c4ac351224f5b254f9ad0b820f43cad292d6565f796bf083173e14723f1e543c85a61689ddd5cb6666b240c15c38ce3320bf0c3be9e0322e5ef72366c294d3a2d7e8b8e7db875e7ae814537554f10b91c72b8b413e026bd5d5e917de4b54fa8f43f38771a7f242aa32dcb7ca1b0588dbf54af7ab9455047fbb894cdfdd242166db784276430eb47d4df092a6b8cb160eb982fe7d14a44283bdb4a9861ca65c06fd8b2546cfbfe38bc77f527de1b9bfd2c95a3e283b7b1d1d2b2fa291256a90a7003aefcef47ceabf113865a494af43e96a38b0b00919855eb7722ea2363e0ddfc9c51c08631d01e2a2d56e786b4ff6f1e5d415facc9c2619c285d9ad43001878294157cb025f639fb954271fd1d6173f6bc16535672f6abdd72b0284b4ff3eaf5b7247719d7c39365622610efae6562bef6e08a0b370fba75bb04dbdb90a482d8417e057f8bd021ea6ac32d0d48b08be9f77833b11e5e739960c9837d7583", "c0a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400ff698adfda0327f188e2ee35f7aecc0f90c9138a350d450648d968c2b5dd7ef94ddd3ec418dc0d03ee4956feb708d838ed2b20e5a193465a6a1467fd3054e1ea141ea4c4c503a6271e19a090e2a69a24282e3be04c4f98720f7a0eb274d9693d13a8e3c139aa625fa2aefd09854570527f9ac545bda1b689719f5cb715612c07");
+        _verify_tap_commitments("5120afddc189ea51094b4cbf463806792e9c8b35dfdc5e01228c78376380d0046b00", "83", "c0a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f4007388cda01113397d4cd00bcfbd08fd68c3cfe3a42cbfe3a7651c1d5e6dacf1ad99aaf103cceb41d9bc37ec231aca89b984b5fd3c65977ce764d51033ac65adb4b59764bec92507e4a4c3f01a06f05980163ca10f1c549bfe01f85fa4f109a1295e607f5ed9f1008048474de336f11f67a1fbf2012f58944dede0ab19a3ca81f5");
+        _verify_tap_commitments("512093c7378d96518a75448821c4f7c8f4bae7ce60f804d03d1f0628dd5dd0f5de51", "04ffffffff203455139bf238a3067bd72ed77e0ab8db590330f55ed58dba7366b53bf4734279ba04feffffff87ab", "c1a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f400c9a5cd1f6c8a81f5648e39f9810591df1c9a8f1fe97c92e03ecd7c0c016c951983e05473c6e8238cb4c780ea2ce62552b2a3eee068ceffc00517cd7b97e10dad");
     }
 
     #[test]
     fn build_huffman_tree() {
-        let secp = Secp256k1::verification_only();
         let internal_key = "93c7378d96518a75448821c4f7c8f4bae7ce60f804d03d1f0628dd5dd0f5de51"
             .parse::<UntweakedPublicKey>()
             .unwrap();
 
         let script_weights = [
-            (10, ScriptBuf::from_hex_no_length_prefix("51").unwrap()), // semantics of script don't matter for this test
-            (20, ScriptBuf::from_hex_no_length_prefix("52").unwrap()),
-            (20, ScriptBuf::from_hex_no_length_prefix("53").unwrap()),
-            (30, ScriptBuf::from_hex_no_length_prefix("54").unwrap()),
-            (19, ScriptBuf::from_hex_no_length_prefix("55").unwrap()),
+            (10, TapScriptBuf::from_hex_no_length_prefix("51").unwrap()), // semantics of script don't matter for this test
+            (20, TapScriptBuf::from_hex_no_length_prefix("52").unwrap()),
+            (20, TapScriptBuf::from_hex_no_length_prefix("53").unwrap()),
+            (30, TapScriptBuf::from_hex_no_length_prefix("54").unwrap()),
+            (19, TapScriptBuf::from_hex_no_length_prefix("55").unwrap()),
         ];
         let tree_info =
-            TaprootSpendInfo::with_huffman_tree(&secp, internal_key, script_weights.clone())
-                .unwrap();
+            TaprootSpendInfo::with_huffman_tree(internal_key, script_weights.clone()).unwrap();
 
         /* The resulting tree should put the scripts into a tree similar
          * to the following:
@@ -1884,7 +1670,7 @@ mod test {
                 tree_info
                     .script_map
                     .get(&(
-                        ScriptBuf::from_hex_no_length_prefix(script).unwrap(),
+                        TapScriptBuf::from_hex_no_length_prefix(script).unwrap(),
                         LeafVersion::TapScript
                     ))
                     .expect("Present Key")
@@ -1902,17 +1688,13 @@ mod test {
         for (_weights, script) in script_weights {
             let ver_script = (script, LeafVersion::TapScript);
             let ctrl_block = tree_info.control_block(&ver_script).unwrap();
-            assert!(ctrl_block.verify_taproot_commitment(
-                &secp,
-                output_key.to_x_only_public_key(),
-                &ver_script.0
-            ))
+            assert!(ctrl_block
+                .verify_taproot_commitment(output_key.to_x_only_public_key(), &ver_script.0))
         }
     }
 
     #[test]
     fn taptree_builder() {
-        let secp = Secp256k1::verification_only();
         let internal_key = "93c7378d96518a75448821c4f7c8f4bae7ce60f804d03d1f0628dd5dd0f5de51"
             .parse::<UntweakedPublicKey>()
             .unwrap();
@@ -1927,18 +1709,18 @@ mod test {
         //                                   /  \    /  \
         //                                  A    B  C  / \
         //                                            D   E
-        let a = ScriptBuf::from_hex_no_length_prefix("51").unwrap();
-        let b = ScriptBuf::from_hex_no_length_prefix("52").unwrap();
-        let c = ScriptBuf::from_hex_no_length_prefix("53").unwrap();
-        let d = ScriptBuf::from_hex_no_length_prefix("54").unwrap();
-        let e = ScriptBuf::from_hex_no_length_prefix("55").unwrap();
+        let a = TapScriptBuf::from_hex_no_length_prefix("51").unwrap();
+        let b = TapScriptBuf::from_hex_no_length_prefix("52").unwrap();
+        let c = TapScriptBuf::from_hex_no_length_prefix("53").unwrap();
+        let d = TapScriptBuf::from_hex_no_length_prefix("54").unwrap();
+        let e = TapScriptBuf::from_hex_no_length_prefix("55").unwrap();
         let builder = builder.add_leaf(2, a.clone()).unwrap();
         let builder = builder.add_leaf(2, b.clone()).unwrap();
         let builder = builder.add_leaf(2, c.clone()).unwrap();
         let builder = builder.add_leaf(3, d.clone()).unwrap();
 
         // Trying to finalize an incomplete tree returns the Err(builder)
-        let builder = builder.finalize(&secp, internal_key).unwrap_err();
+        let builder = builder.finalize(internal_key).unwrap_err();
         let builder = builder.add_leaf(3, e.clone()).unwrap();
 
         #[cfg(feature = "serde")]
@@ -1970,17 +1752,14 @@ mod test {
             ],);
         }
 
-        let tree_info = builder.finalize(&secp, internal_key).unwrap();
+        let tree_info = builder.finalize(internal_key).unwrap();
         let output_key = tree_info.output_key();
 
         for script in [a, b, c, d, e] {
             let ver_script = (script, LeafVersion::TapScript);
             let ctrl_block = tree_info.control_block(&ver_script).unwrap();
-            assert!(ctrl_block.verify_taproot_commitment(
-                &secp,
-                output_key.to_x_only_public_key(),
-                &ver_script.0
-            ))
+            assert!(ctrl_block
+                .verify_taproot_commitment(output_key.to_x_only_public_key(), &ver_script.0))
         }
     }
 
@@ -2022,103 +1801,5 @@ mod test {
                 Token::SeqEnd,
             ],
         );
-    }
-
-    #[test]
-    fn bip_341_tests() {
-        fn process_script_trees(
-            v: &serde_json::Value,
-            mut builder: TaprootBuilder,
-            leaves: &mut Vec<(ScriptBuf, LeafVersion)>,
-            depth: u8,
-        ) -> TaprootBuilder {
-            if v.is_null() {
-                // nothing to push
-            } else if v.is_array() {
-                for leaf in v.as_array().unwrap() {
-                    builder = process_script_trees(leaf, builder, leaves, depth + 1);
-                }
-            } else {
-                let script =
-                    ScriptBuf::from_hex_no_length_prefix(v["script"].as_str().unwrap()).unwrap();
-                let ver =
-                    LeafVersion::from_consensus(v["leafVersion"].as_u64().unwrap() as u8).unwrap();
-                leaves.push((script.clone(), ver));
-                builder = builder.add_leaf_with_ver(depth, script, ver).unwrap();
-            }
-            builder
-        }
-
-        let data = bip_341_read_json();
-        // Check the version of data
-        assert!(data["version"] == 1);
-        let secp = &secp256k1::Secp256k1::verification_only();
-
-        for arr in data["scriptPubKey"].as_array().unwrap() {
-            let internal_key =
-                arr["given"]["internalPubkey"].as_str().unwrap().parse::<XOnlyPublicKey>().unwrap();
-            // process the tree
-            let script_tree = &arr["given"]["scriptTree"];
-            let mut merkle_root = None;
-            if script_tree.is_null() {
-                assert!(arr["intermediary"]["merkleRoot"].is_null());
-            } else {
-                merkle_root = Some(
-                    arr["intermediary"]["merkleRoot"]
-                        .as_str()
-                        .unwrap()
-                        .parse::<TapNodeHash>()
-                        .unwrap(),
-                );
-                let leaf_hashes = arr["intermediary"]["leafHashes"].as_array().unwrap();
-                let ctrl_blks = arr["expected"]["scriptPathControlBlocks"].as_array().unwrap();
-                let mut builder = TaprootBuilder::new();
-                let mut leaves = vec![];
-                builder = process_script_trees(script_tree, builder, &mut leaves, 0);
-                let spend_info = builder.finalize(secp, internal_key).unwrap();
-                for (i, script_ver) in leaves.iter().enumerate() {
-                    let expected_leaf_hash = leaf_hashes[i].as_str().unwrap();
-                    let expected_ctrl_blk =
-                        ControlBlock::from_hex(ctrl_blks[i].as_str().unwrap()).unwrap();
-
-                    let leaf_hash = TapLeafHash::from_script(&script_ver.0, script_ver.1);
-                    let ctrl_blk = spend_info.control_block(script_ver).unwrap();
-                    assert_eq!(leaf_hash.to_string(), expected_leaf_hash);
-                    assert_eq!(ctrl_blk, expected_ctrl_blk);
-                }
-            }
-            let expected_output_key = arr["intermediary"]["tweakedPubkey"]
-                .as_str()
-                .unwrap()
-                .parse::<XOnlyPublicKey>()
-                .unwrap();
-            let expected_tweak =
-                arr["intermediary"]["tweak"].as_str().unwrap().parse::<TapTweakHash>().unwrap();
-            let expected_spk = ScriptBuf::from_hex_no_length_prefix(
-                arr["expected"]["scriptPubKey"].as_str().unwrap(),
-            )
-            .unwrap();
-            let expected_addr = arr["expected"]["bip350Address"]
-                .as_str()
-                .unwrap()
-                .parse::<Address<_>>()
-                .unwrap()
-                .assume_checked();
-
-            let tweak = TapTweakHash::from_key_and_merkle_root(internal_key, merkle_root);
-            let (output_key, _parity) = internal_key.tap_tweak(secp, merkle_root);
-            let addr = Address::p2tr(secp, internal_key, merkle_root, KnownHrp::Mainnet);
-            let spk = addr.script_pubkey();
-
-            assert_eq!(expected_output_key, output_key.to_x_only_public_key());
-            assert_eq!(expected_tweak, tweak);
-            assert_eq!(expected_addr, addr);
-            assert_eq!(expected_spk, spk);
-        }
-    }
-
-    fn bip_341_read_json() -> serde_json::Value {
-        let json_str = include_str!("../../tests/data/bip341_tests.json");
-        serde_json::from_str(json_str).expect("JSON was not well-formatted")
     }
 }

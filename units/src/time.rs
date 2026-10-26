@@ -7,10 +7,19 @@
 //! This differs from other UNIX timestamps in that we only use non-negative values. The Epoch
 //! pre-dates Bitcoin so timestamps before this are not useful for block timestamps.
 
+use core::fmt;
+
 #[cfg(feature = "arbitrary")]
 use arbitrary::{Arbitrary, Unstructured};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::parse_int::{self, PrefixedHexError, UnprefixedHexError};
+
+#[rustfmt::skip]                // Keep public re-exports separate.
+#[cfg(feature = "encoding")]
+#[doc(no_inline)]
+pub use self::error::BlockTimeDecoderError;
 
 mod encapsulate {
     /// A Bitcoin block timestamp.
@@ -31,7 +40,7 @@ mod encapsulate {
     impl BlockTime {
         /// Constructs a new [`BlockTime`] from an unsigned 32 bit integer value.
         #[inline]
-        pub const fn from_u32(t: u32) -> Self { BlockTime(t) }
+        pub const fn from_u32(t: u32) -> Self { Self(t) }
 
         /// Returns the inner `u32` value.
         #[inline]
@@ -40,6 +49,39 @@ mod encapsulate {
 }
 #[doc(inline)]
 pub use encapsulate::BlockTime;
+
+impl BlockTime {
+    /// Constructs a new [`BlockTime`] from a prefixed hex string.
+    ///
+    /// # Errors
+    ///
+    /// If the input string is not a valid hex representation of a blocktime or it does not include
+    /// the `0x` prefix.
+    #[inline]
+    pub fn from_hex(s: &str) -> Result<Self, PrefixedHexError> {
+        let block_time = parse_int::hex_u32_prefixed(s)?;
+        Ok(Self::from_u32(block_time))
+    }
+
+    /// Constructs a new [`BlockTime`] from an unprefixed hex string.
+    ///
+    /// # Errors
+    ///
+    /// If the input string is not a valid hex representation of a blocktime or if it includes the
+    /// `0x` prefix.
+    #[inline]
+    pub fn from_unprefixed_hex(s: &str) -> Result<Self, UnprefixedHexError> {
+        let block_time = parse_int::hex_u32_unprefixed(s)?;
+        Ok(Self::from_u32(block_time))
+    }
+}
+
+crate::internal_macros::impl_fmt_traits_for_u32_wrapper!(BlockTime, to_u32);
+
+impl fmt::Display for BlockTime {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&self.to_u32(), f) }
+}
 
 impl From<u32> for BlockTime {
     #[inline]
@@ -50,6 +92,8 @@ impl From<BlockTime> for u32 {
     #[inline]
     fn from(t: BlockTime) -> Self { t.to_u32() }
 }
+
+parse_int::impl_parse_str_from_int_infallible!(BlockTime, u32, from_u32);
 
 #[cfg(feature = "serde")]
 impl Serialize for BlockTime {
@@ -73,22 +117,159 @@ impl<'de> Deserialize<'de> for BlockTime {
     }
 }
 
+#[cfg(feature = "encoding")]
+impl encoding::Encode for BlockTime {
+    type Encoder<'e> = BlockTimeEncoder<'e>;
+    #[inline]
+    fn encoder(&self) -> Self::Encoder<'_> {
+        BlockTimeEncoder::new(encoding::ArrayEncoder::without_length_prefix(
+            self.to_u32().to_le_bytes(),
+        ))
+    }
+}
+
+#[cfg(feature = "encoding")]
+impl encoding::Decode for BlockTime {
+    type Decoder = BlockTimeDecoder;
+}
+
+#[cfg(feature = "encoding")]
+encoding::encoder_newtype_exact! {
+    /// The encoder for the [`BlockTime`] type.
+    #[derive(Debug, Clone)]
+    pub struct BlockTimeEncoder<'e>(encoding::ArrayEncoder<4>);
+}
+
+#[cfg(feature = "encoding")]
+crate::decoder_newtype! {
+    /// The decoder for the [`BlockTime`] type.
+    #[derive(Debug, Clone)]
+    pub struct BlockTimeDecoder(encoding::ArrayDecoder<4>);
+
+    /// Constructs a new [`BlockTime`] decoder.
+    pub const fn new() -> Self { Self(encoding::ArrayDecoder::new()) }
+
+    fn end(result: Result<[u8; 4], encoding::UnexpectedEofError>) -> Result<BlockTime, BlockTimeDecoderError> {
+        let value = result.map_err(BlockTimeDecoderError)?;
+        let n = u32::from_le_bytes(value);
+        Ok(BlockTime::from_u32(n))
+    }
+}
+
+/// Error types for block times.
+pub mod error {
+    #[cfg(feature = "encoding")]
+    use core::convert::Infallible;
+    #[cfg(feature = "encoding")]
+    use core::fmt;
+
+    #[cfg(feature = "encoding")]
+    use internals::write_err;
+
+    /// An error consensus decoding a [`BlockTime`].
+    ///
+    /// [`BlockTime`]: super::BlockTime
+    #[cfg(feature = "encoding")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct BlockTimeDecoderError(pub(super) encoding::UnexpectedEofError);
+
+    #[cfg(feature = "encoding")]
+    impl From<Infallible> for BlockTimeDecoderError {
+        #[inline]
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    #[cfg(feature = "encoding")]
+    impl fmt::Display for BlockTimeDecoderError {
+        #[inline]
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write_err!(f, "block time decoder error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "encoding")]
+    #[cfg(feature = "std")]
+    impl std::error::Error for BlockTimeDecoderError {
+        #[inline]
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+}
+
 #[cfg(feature = "arbitrary")]
 impl<'a> Arbitrary<'a> for BlockTime {
     #[inline]
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
         let t: u32 = u.arbitrary()?;
-        Ok(BlockTime::from(t))
+        Ok(Self::from(t))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "alloc")]
+    use alloc::string::ToString;
+    #[cfg(feature = "encoding")]
+    #[cfg(feature = "std")]
+    use std::error::Error;
+
+    #[cfg(feature = "encoding")]
+    use encoding::Decoder as _;
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "encoding")]
+    use encoding::UnexpectedEofError;
+
     use super::*;
 
     #[test]
     fn block_time_round_trip() {
         let t = BlockTime::from(1_742_979_600); // 26 Mar 2025 9:00 UTC
         assert_eq!(u32::from(t), 1_742_979_600);
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn block_time_serde_round_trip() {
+        let t = BlockTime::from(1_765_364_400); // 10 Dec 2025 11:00 UTC
+
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(json, "1765364400"); // ASCII number representation
+
+        let roundtrip = serde_json::from_str::<BlockTime>(&json).unwrap();
+        assert_eq!(t, roundtrip);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "encoding")]
+    fn block_time_decoding_error() {
+        let bytes = [0xb0, 0x52, 0x39]; // 3 bytes is an EOF error
+
+        let mut decoder = BlockTimeDecoder::default();
+        assert!(decoder.push_bytes(&mut bytes.as_slice()).unwrap().needs_more());
+
+        let error = decoder.end().unwrap_err();
+        assert!(matches!(error, BlockTimeDecoderError(UnexpectedEofError { .. })));
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn time_module_display() {
+        assert_eq!(BlockTime::from(1_765_364_400).to_string(), "1765364400");
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "encoding")]
+    fn time_module_error_display() {
+        // BlockTimeDecoderError
+        let bytes = [0xb0, 0x52, 0x39]; // 3 bytes is an EOF error
+
+        let mut decoder = BlockTimeDecoder::default();
+        let _ = decoder.push_bytes(&mut bytes.as_slice());
+
+        let e = decoder.end().unwrap_err();
+        assert!(!e.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(e.source().is_some());
     }
 }

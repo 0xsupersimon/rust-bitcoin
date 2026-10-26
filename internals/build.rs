@@ -1,5 +1,5 @@
 // Exclude lints we don't think are valuable.
-#![allow(clippy::uninlined_format_args)] // Allow `format!("{}", x)`instead of enforcing `format!("{x}")`
+#![allow(clippy::uninlined_format_args)] // Allow `format!("{}", x)` instead of enforcing `format!("{x}")`
 
 const MAX_USED_VERSION: u64 = 80;
 
@@ -7,17 +7,15 @@ use std::io;
 
 fn main() {
     let rustc = std::env::var_os("RUSTC");
-    let rustc = rustc.as_ref().map(std::path::Path::new).unwrap_or_else(|| "rustc".as_ref());
-    let output = std::process::Command::new(rustc)
-        .arg("--version")
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run `{:?} --version`: {:?}", rustc, error));
-    assert!(output.status.success(), "{:?} -- version returned non-zero exit code", rustc);
+    let rustc = rustc.as_ref().map_or_else(|| "rustc".as_ref(), std::path::Path::new);
+    let output =
+        std::process::Command::new(rustc).arg("--version").output().unwrap_or_else(|error| {
+            panic!("failed to run `{} --version`: {:?}", rustc.display(), error)
+        });
+    assert!(output.status.success(), "{} -- version returned non-zero exit code", rustc.display());
     let stdout = String::from_utf8(output.stdout).expect("rustc produced non-UTF-8 output");
     let version_prefix = "rustc ";
-    if !stdout.starts_with(version_prefix) {
-        panic!("unexpected rustc output: {}", stdout);
-    }
+    assert!(stdout.starts_with(version_prefix), "unexpected rustc output: {}", stdout);
 
     let version = &stdout[version_prefix.len()..];
     let end = version.find(&[' ', '-'] as &[_]).unwrap_or(version.len());
@@ -32,7 +30,7 @@ fn main() {
         .expect("invalid Rust minor version");
 
     let msrv = std::env::var("CARGO_PKG_RUST_VERSION").unwrap();
-    let mut msrv = msrv.split(".");
+    let mut msrv = msrv.split('.');
     let msrv_major = msrv.next().unwrap();
     assert_eq!(msrv_major, "1", "unexpected Rust major version");
     let msrv_minor = msrv.next().unwrap().parse::<u64>().unwrap();
@@ -51,10 +49,10 @@ fn write_macro(mut macro_file: impl io::Write, msrv_minor: u64, minor: u64) -> i
     writeln!(macro_file, "/// Example:")?;
     writeln!(macro_file, "/// ```")?;
     writeln!(macro_file, "/// bitcoin_internals::rust_version! {{")?;
-    writeln!(macro_file, "///     if >= 1.70 {{")?;
-    writeln!(macro_file, "///         println!(\"This is Rust 1.70+\");")?;
+    writeln!(macro_file, "///     if >= 1.78 {{")?;
+    writeln!(macro_file, "///         println!(\"This is Rust 1.78+\");")?;
     writeln!(macro_file, "///     }} else {{")?;
-    writeln!(macro_file, "///         println!(\"This is Rust < 1.70\");")?;
+    writeln!(macro_file, "///         println!(\"This is Rust < 1.78\");")?;
     writeln!(macro_file, "///     }}")?;
     writeln!(macro_file, "/// }}")?;
     writeln!(macro_file, "/// ```")?;
@@ -75,7 +73,7 @@ fn write_macro(mut macro_file: impl io::Write, msrv_minor: u64, minor: u64) -> i
         writeln!(macro_file, "        $($if_yes)*")?;
         writeln!(macro_file, "    }};")?;
     }
-    for version in (minor + 1)..(MAX_USED_VERSION + 1) {
+    for version in (minor + 1)..=MAX_USED_VERSION {
         writeln!(
             macro_file,
             "    (if >= 1.{} {{ $($if_yes:tt)* }} $(else {{ $($if_no:tt)* }})?) => {{",

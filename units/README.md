@@ -2,11 +2,12 @@
 
 This crate provides basic Bitcoin numeric units such as `Amount`.
 
-## Minimum Supported Rust Version (MSRV)
+## `bitcoin-units v0.3.0`
 
-This library should always compile with any combination of features on **Rust 1.63.0**.
+This is the start of the `v1.0.0` release candidate cycle. We will
+endeavour to not release breaking changes unless totally necessary and
+will honour semver rules as usual. From this release forward we will
+semver trick as possible in subsequent releases to assist downstream
+users testing these releases.
 
-## Licensing
-
-The code in this project is licensed under the [Creative Commons CC0 1.0 Universal license](../LICENSE).
-We use the [SPDX license list](https://spdx.org/licenses/) and [SPDX IDs](https://spdx.dev/ids/).
+Thanks for your patience and help.

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! SHA256t implementation (tagged SHA256).
+//! `SHA256t` implementation (tagged SHA256).
 
 use core::cmp;
 use core::marker::PhantomData;
@@ -37,14 +37,15 @@ where
     engine.finalize()
 }
 
-/// Trait representing a tag that can be used as a context for SHA256t hashes.
+/// Trait representing a tag that can be used as a context for `SHA256t` hashes.
 pub trait Tag {
     /// The [`Midstate`] after pre-tagging the hash engine.
     const MIDSTATE: sha256::Midstate;
 }
 
-internals::transparent_newtype! {
-    /// Output of the SHA256t hash function.
+// Defined in `REPO_DIR/include/newtype.rs`.
+crate::transparent_newtype! {
+    /// Output of the `SHA256t` hash function.
     pub struct Hash<T>(PhantomData<T>, [u8; 32]);
 
     impl<T> Hash<T> {
@@ -65,24 +66,9 @@ where
     /// Constructs a new hash from the underlying byte array.
     pub const fn from_byte_array(bytes: [u8; 32]) -> Self { Self(PhantomData, bytes) }
 
-    /// Copies a byte slice into a hash object.
-    #[deprecated(since = "0.15.0", note = "use `from_byte_array` instead")]
-    #[allow(deprecated_in_future)] // Because of `FromSliceError`.
-    pub fn from_slice(sl: &[u8]) -> Result<Hash<T>, crate::FromSliceError> {
-        use crate::error::FromSliceErrorInner;
-
-        if sl.len() != 32 {
-            Err(crate::error::FromSliceError(FromSliceErrorInner { expected: 32, got: sl.len() }))
-        } else {
-            let mut ret = [0; 32];
-            ret.copy_from_slice(sl);
-            Ok(Self::from_byte_array(ret))
-        }
-    }
-
     /// Produces a hash from the current state of a given engine.
     pub fn from_engine(e: HashEngine<T>) -> Self {
-        Hash::from_byte_array(sha256::Hash::from_engine(e.0).to_byte_array())
+        Self::from_byte_array(sha256::Hash::from_engine(e.0).to_byte_array())
     }
 
     /// Constructs a new engine.
@@ -123,16 +109,16 @@ impl<T: Tag> Clone for Hash<T> {
     fn clone(&self) -> Self { *self }
 }
 impl<T: Tag> PartialEq for Hash<T> {
-    fn eq(&self, other: &Hash<T>) -> bool { self.as_byte_array() == other.as_byte_array() }
+    fn eq(&self, other: &Self) -> bool { self.as_byte_array() == other.as_byte_array() }
 }
 impl<T: Tag> Eq for Hash<T> {}
 impl<T: Tag> PartialOrd for Hash<T> {
-    fn partial_cmp(&self, other: &Hash<T>) -> Option<cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
         Some(cmp::Ord::cmp(self, other))
     }
 }
 impl<T: Tag> Ord for Hash<T> {
-    fn cmp(&self, other: &Hash<T>) -> cmp::Ordering {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
         cmp::Ord::cmp(&self.as_byte_array(), &other.as_byte_array())
     }
 }
@@ -142,14 +128,14 @@ impl<T: Tag> core::hash::Hash for Hash<T> {
 
 crate::internal_macros::hash_trait_impls!(256, false, T: Tag);
 
-/// Engine to compute SHA256t hash function.
+/// Engine to compute `SHA256t` hash function.
 #[derive(Debug)]
 pub struct HashEngine<T>(sha256::HashEngine, PhantomData<T>);
 
 impl<T: Tag> Default for HashEngine<T> {
     fn default() -> Self {
-        let tagged = sha256::HashEngine::from_midstate(T::MIDSTATE);
-        HashEngine(tagged, PhantomData)
+        let tagged = T::MIDSTATE.to_engine();
+        Self(tagged, PhantomData)
     }
 }
 
@@ -159,7 +145,6 @@ impl<T: Tag> Clone for HashEngine<T> {
 
 impl<T: Tag> crate::HashEngine for HashEngine<T> {
     type Hash = Hash<T>;
-    type Bytes = [u8; 32];
     const BLOCK_SIZE: usize = 64; // Same as sha256::HashEngine::BLOCK_SIZE;
 
     fn input(&mut self, data: &[u8]) { self.0.input(data) }
@@ -207,14 +192,19 @@ macro_rules! sha256t_tag_constructor {
 
 #[cfg(test)]
 mod tests {
-    use crate::{sha256, sha256t};
+    #![allow(deprecated)]
+
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    use crate::sha256;
+    use crate::sha256t;
 
     const TEST_MIDSTATE: [u8; 32] = [
         156, 224, 228, 230, 124, 17, 108, 57, 56, 179, 202, 242, 195, 15, 80, 137, 211, 243, 147,
         108, 71, 99, 110, 96, 125, 179, 62, 234, 221, 198, 240, 201,
     ];
 
-    // The digest created by sha256 hashing `&[0]` starting with `TEST_MIDSTATE`.
+    // The digest created by SHA256 hashing `&[0]` starting with `TEST_MIDSTATE`.
     #[cfg(feature = "alloc")]
     #[cfg(feature = "hex")]
     const HASH_ZERO_BACKWARD: &str =
@@ -226,8 +216,12 @@ mod tests {
         "ed1382037800c9dd938dd8854f1a8863bcdeb6705069b4b56a66ec22519d5829";
 
     #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
     pub struct TestHashTag;
 
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
     impl sha256t::Tag for TestHashTag {
         const MIDSTATE: sha256::Midstate = sha256::Midstate::new(TEST_MIDSTATE, 64);
     }

@@ -68,6 +68,10 @@ impl InputString {
     ///     }
     /// }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write to the formatter fails.
     pub fn unknown_variant<T>(&self, what: &T, f: &mut fmt::Formatter) -> fmt::Result
     where
         T: fmt::Display + ?Sized,
@@ -122,7 +126,7 @@ mod storage {
     }
 
     impl From<&str> for Storage {
-        fn from(_value: &str) -> Self { Storage }
+        fn from(_value: &str) -> Self { Self }
     }
 
     pub(super) fn cannot_parse<W>(_: &Storage, what: &W, f: &mut fmt::Formatter) -> fmt::Result
@@ -152,14 +156,14 @@ mod storage {
     where
         W: fmt::Display + ?Sized,
     {
-        write!(f, "failed to parse '{}' as {}", input, what)
+        write!(f, "failed to parse '{}' as {}", input.escape_debug(), what)
     }
 
     pub(super) fn unknown_variant<W>(inp: &Storage, what: &W, f: &mut fmt::Formatter) -> fmt::Result
     where
         W: fmt::Display + ?Sized,
     {
-        write!(f, "'{}' is not a known {}", inp, what)
+        write!(f, "'{}' is not a known {}", inp.escape_debug(), what)
     }
 
     impl_from!(alloc::string::String, alloc::boxed::Box<str>, alloc::borrow::Cow<'_, str>);

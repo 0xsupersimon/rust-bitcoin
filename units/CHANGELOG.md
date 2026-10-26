@@ -1,12 +1,86 @@
-# 1.0.0 - 2025-02-24
+# Changelog
+
+## [Unreleased]
+
+## [0.6.0] - 2026-10-14
+
+* Make zero target convert to zero work [#6872](https://github.com/rust-bitcoin/rust-bitcoin/pull/6872)
+* Add saturating arithmetic methods to `Weight` [#7038](https://github.com/rust-bitcoin/rust-bitcoin/pull/7038)
+* Add saturating arithmetic methods to `FeeRate` [#7005](https://github.com/rust-bitcoin/rust-bitcoin/pull/7005)
+* Fix inverted relative locktime error msg [#6970](https://github.com/rust-bitcoin/rust-bitcoin/pull/6970)
+* Fix serialization of optional amounts [#7001](https://github.com/rust-bitcoin/rust-bitcoin/pull/7001)
+* Make `parse_int` helper functions private [#6999](https://github.com/rust-bitcoin/rust-bitcoin/pull/6999)
+* Drop `PartialOrd` and `Ord` from `CompactTarget` [#6989](https://github.com/rust-bitcoin/rust-bitcoin/pull/6989)
+* Reject malformed amount strings [#6893](https://github.com/rust-bitcoin/rust-bitcoin/pull/6893)
+* Remove `Into` from `Sum` impl for amount types [#6914](https://github.com/rust-bitcoin/rust-bitcoin/pull/6914)
+* Remove amount parsing limit [#6851](https://github.com/rust-bitcoin/rust-bitcoin/pull/6851)
+* Fix `OutOfRangeError::valid_range` [#6829](https://github.com/rust-bitcoin/rust-bitcoin/pull/6829)
+* Fix `div_by_fee_rate_floor` precision [#6884](https://github.com/rust-bitcoin/rust-bitcoin/pull/6884)
+* Preserve error in `NumOpResult` add and sub [#6862](https://github.com/rust-bitcoin/rust-bitcoin/pull/6862)
+* Do not implement `Copy` for error types [#6894](https://github.com/rust-bitcoin/rust-bitcoin/pull/6894)
+* Separate mathematical operation and failure mode in `NumOpError` [#6812](https://github.com/rust-bitcoin/rust-bitcoin/pull/6812)
+* Preserve MvB precision in `FeeRate::mul_by_weight` [#6823](https://github.com/rust-bitcoin/rust-bitcoin/pull/6823)
+* Fix `OutOfRangeError::valid_range` [#6829](https://github.com/rust-bitcoin/rust-bitcoin/pull/6829)
+* Rename locktime height accessors and query methods [#6689](https://github.com/rust-bitcoin/rust-bitcoin/pull/6689)
+* Implement `Neg` for `Amount` and `NumOpResult` [#6710](https://github.com/rust-bitcoin/rust-bitcoin/pull/6710)
+* Add `Div` and `DivAssign` for `NonZero` to `Amount` types [#6676](https://github.com/rust-bitcoin/rust-bitcoin/pull/6676)
+* Add support for satisfaction of parent/child transactions [#6649](https://github.com/rust-bitcoin/rust-bitcoin/pull/6649)
+* Flatten error constructors [#6694](https://github.com/rust-bitcoin/rust-bitcoin/pull/6694)
+* Add `Weight::to_vb_*` functions, deprecating `to_vbytes_*` [#6678](https://github.com/rust-bitcoin/rust-bitcoin/pull/6678)
+* Implement `serde` traits for absolute locktime types [#6633](https://github.com/rust-bitcoin/rust-bitcoin/pull/6633)
+* Add `RemAssign` to `NumOpResult<Amount/SignedAmount>` [#6669](https://github.com/rust-bitcoin/rust-bitcoin/pull/6669)
+* Add `CompactTarget::to_consensus_u32` [#6683](https://github.com/rust-bitcoin/rust-bitcoin/pull/6683)
+* Remove `From<u16>` from `NumberOfBlocks` [#6661](https://github.com/rust-bitcoin/rust-bitcoin/pull/6661)
+* Make `Sum` impl generic for `Signed/Amount -> NumOpResult` [#6648](https://github.com/rust-bitcoin/rust-bitcoin/pull/6648)
+* Add `to_target` conversion to `CompactTarget` [#6650](https://github.com/rust-bitcoin/rust-bitcoin/pull/6650)
+* Make `Sequence` inner field private and remove default [#6645](https://github.com/rust-bitcoin/rust-bitcoin/pull/6645)
+* Make `Weight % Weight` return `Weight` [#6652](https://github.com/rust-bitcoin/rust-bitcoin/pull/6652)
+* Fix off-by-one error in satisfied by height [#6582](https://github.com/rust-bitcoin/rust-bitcoin/pull/6582)
+* Restore the +1 in relative locktime satisfied by height [#6640](https://github.com/rust-bitcoin/rust-bitcoin/pull/6640)
+* Fix off-by-one in `MedianTimePast::is_satisfied_by` [#6384](https://github.com/rust-bitcoin/rust-bitcoin/pull/6384)
+* `Target`/`Work`'s internal `U256` type is now sourced from `bitcoin-internals` instead of a duplicated `include!` module.
+
+## [0.5.0] - 2026-06-09
+
+* Remove `_unchecked` hex parsing function [#6292](https://github.com/rust-bitcoin/rust-bitcoin/pull/6292)
+* Remove all deprecated code [#6290](https://github.com/rust-bitcoin/rust-bitcoin/pull/6290).
+
+## [0.4.0] - 2026-05-27
+
+* Add format traits for `Target` and `Work` [#5626](https://github.com/rust-bitcoin/rust-bitcoin/pull/5626)
+* Move remaining `pow` types to units [#5608](https://github.com/rust-bitcoin/rust-bitcoin/pull/5608)
+* Extend `parse_int` and add hex string parsing to integer wrapper types [#5782](https://github.com/rust-bitcoin/rust-bitcoin/pull/5782)
+* Remove `From<SubError>` for error types [#5855](https://github.com/rust-bitcoin/rust-bitcoin/pull/5855)
+* Re-export `serde` and `arbitrary` when they appear in public API [#5862](https://github.com/rust-bitcoin/rust-bitcoin/pull/5862)
+* Unify `FromStr` impls for integer wrapper types [#5783](https://github.com/rust-bitcoin/rust-bitcoin/pull/5783)
+* Add `serde` support for `Vec<T>` [#5786](https://github.com/rust-bitcoin/rust-bitcoin/pull/5786)
+* Add next target calculation [#5544](https://github.com/rust-bitcoin/rust-bitcoin/pull/5544)
+* Move and improve `CompactTarget` [#5511](https://github.com/rust-bitcoin/rust-bitcoin/pull/5511)
+* Add `fmt` traits for simple wrapper types [#5510](https://github.com/rust-bitcoin/rust-bitcoin/pull/5510)
+* Upgrade to `consensus-encoding 1.0.0`
+
+Please note the breaking change in how we define encoders had the effect of breaking
+every type in the lib so there is no semver tricking done in this release - sorry.
+
+## [0.3.0] - 2026-02-17
+
+It was found that the `1.0.0-rc.x` releases were troublesome because
+of how `cargo` resolves version numbers that include a suffix. For
+this reason we elected to go back to pre-1.0 version numbers.
+
+- Add next target calculation [#5544](https://github.com/rust-bitcoin/rust-bitcoin/pull/5544)
+
+## 1.0.0 Release Candidates - 2025-02-24
 
 BOOM! A long time in the making but here goes, our first 1.0 crate release.
 
 This changelog is a rolling description of everything that will eventually end up in `v1.0`.
+EDIT: This changelog is for `1.0.0-rc.0` through `1.0.0-rc.4` and may well be missing stuff.
 
 * Introduce limit to `Amount`
   * Prepare to enforce `MAX_MONEY` invariant [#4164](https://github.com/rust-bitcoin/rust-bitcoin/pull/4164)
   * Enforce `MAX_MONEY` invariant in amount types [#4157](https://github.com/rust-bitcoin/rust-bitcoin/pull/4157)
+* Allow underscores as separators in `Amount` values [#5309](https://github.com/rust-bitcoin/rust-bitcoin/pull/5309)
 * New `NumOpResult` type
   * Introduce monadic `NumOpResult` type [#4007](https://github.com/rust-bitcoin/rust-bitcoin/pull/4007)
   * Add impls for `NumOpResult` div and mul [#4337](https://github.com/rust-bitcoin/rust-bitcoin/pull/4337)
@@ -29,20 +103,24 @@ This changelog is a rolling description of everything that will eventually end u
 * Remove `InputString` from the public API [#3905](https://github.com/rust-bitcoin/rust-bitcoin/pull/3905)
 * Hide the remaining public macros [#3867](https://github.com/rust-bitcoin/rust-bitcoin/pull/3867)
 * Change method return type for `to_unsigned()` [#3769](https://github.com/rust-bitcoin/rust-bitcoin/pull/3769)
-* Change paramater type used for whole bitcoin [#3744](https://github.com/rust-bitcoin/rust-bitcoin/pull/3744)
+* Change parameter type used for whole bitcoin [#3744](https://github.com/rust-bitcoin/rust-bitcoin/pull/3744)
 * Add `Weight::to_kwu_ceil` [#3740](https://github.com/rust-bitcoin/rust-bitcoin/pull/3740)
 * Replace `String` with `InputString` [#3559](https://github.com/rust-bitcoin/rust-bitcoin/pull/3559)
+* Do not re-export doc hidden macros
+* Use the new `consensus_encoding` crate to re-write encoding logic.
+  * Decoders with phantoms [#5008](https://github.com/rust-bitcoin/rust-bitcoin/pull/5008)
+  * Improve the decoders [#5027](https://github.com/rust-bitcoin/rust-bitcoin/pull/5027)
 
-## Changes relate to error types
+### Changes relate to error types
 
 * Close the hex parse errors [#3673](https://github.com/rust-bitcoin/rust-bitcoin/pull/3673)
 
-## Improved support for `Arbitrary`
+### Improved support for `Arbitrary`
 
 * Implement `Arbitrary` for `units` types [#3777](https://github.com/rust-bitcoin/rust-bitcoin/pull/3777)
 * Add `Arbitrary` to `Weight` [#3257](https://github.com/rust-bitcoin/rust-bitcoin/pull/3257)
 
-# 0.2.0 - 2024-09-18
+## [0.2.0] - 2024-09-18
 
 * Bump MSRV to 1.63.0 [#3100](https://github.com/rust-bitcoin/rust-bitcoin/pull/3100)
 * Remove re-export of `ParseIntError` [#3069](https://github.com/rust-bitcoin/rust-bitcoin/pull/3069)
@@ -58,7 +136,7 @@ This changelog is a rolling description of everything that will eventually end u
 * Add `FeeRate` addition and subtraction traits [#3381](https://github.com/rust-bitcoin/rust-bitcoin/pull/3381)
 * Add `BlockHeight` and `BlockInterval` types [#2615](https://github.com/rust-bitcoin/rust-bitcoin/pull/2615)
 
-## Additional test infrastructure:`Arbitrary`
+### Additional test infrastructure:`Arbitrary`
 
 This release we started adding implementations of
 [`arbitrary::Arbitrary`](https://docs.rs/arbitrary/latest/arbitrary/trait.Arbitrary.html).
@@ -67,11 +145,32 @@ Types implemented: `Amount`, `SignedAmount`, `FeeRate`, and `Weight`.
 
 In the following PRs:
 
-* [#3305](https://github.com/rust-bitcoin/rust-bitcoin/pull/3015)
+* [#3015](https://github.com/rust-bitcoin/rust-bitcoin/pull/3015)
 * [#3257](https://github.com/rust-bitcoin/rust-bitcoin/pull/3257)
 * [#3247](https://github.com/rust-bitcoin/rust-bitcoin/pull/3274)
 
-## 0.1.2 - 2024-07-01
+## [0.1.101] - 2026-06-24
+
+**Bump the MSRV to Rust 1.60.0**
+
+- Exposes the new stabilized encoding library through the optional `encoding` feature. Note that enabling it bumps the MSRV to 1.74.0.
+
+## [0.1.100] - 2026-05-26 [YANKED]
+
+> This release was yanked because the MSRV bump to 1.74.0 was too aggressive for some users. See version 0.1.101 for a smaller upgrade to 1.60.0.
+
+**Bump the MSRV to Rust 1.74.0**
+
+## [0.1.4] - 2026-05-23
+
+* Remove the `internals` dependency [#6200](https://github.com/rust-bitcoin/rust-bitcoin/pull/6200)
+
+## [0.1.3] - 2026-04-19
+
+* Backport `Arbitrary` to `0.32.x` [#5085](https://github.com/rust-bitcoin/rust-bitcoin/pull/5085)
+* Backport: Add CompactSize range check to deserialization [#5921](https://github.com/rust-bitcoin/rust-bitcoin/pull/5921)
+
+## [0.1.2] - 2024-07-01
 
 * Remove enable of `alloc` feature in the `internals` dependency.
 
@@ -82,7 +181,7 @@ was incorrect because we have an `alloc` feature that enables
 
 `v0.1.1` will be yanked for this reason.
 
-## 0.1.1 - 2024-04-04
+## [0.1.1] - 2024-04-04
 
 * Enable "alloc" feature for `internals` dependency - enables caching
   of parsed input strings in a couple of `amount` error types.
@@ -104,3 +203,16 @@ The main types are:
 ## 0.0.0 - Placeholder release
 
 Empty crate to reserve the name on crates.io
+
+[Unreleased]: https://github.com/rust-bitcoin/rust-bitcoin/compare/bitcoin-units-0.6.0...HEAD
+[0.6.0]: https://github.com/rust-bitcoin/rust-bitcoin/compare/bitcoin-units-0.5.0...bitcoin-units-0.6.0
+[0.5.0]: https://github.com/rust-bitcoin/rust-bitcoin/compare/bitcoin-units-0.4.0...bitcoin-units-0.5.0
+[0.4.0]: https://github.com/rust-bitcoin/rust-bitcoin/compare/bitcoin-units-0.3.0...bitcoin-units-0.4.0
+[0.3.0]: https://github.com/rust-bitcoin/rust-bitcoin/compare/units-0.2.0...bitcoin-units-0.3.0
+[0.2.0]: https://github.com/rust-bitcoin/rust-bitcoin/compare/units-0.1.2...units-0.2.0
+[0.1.101]: https://github.com/rust-bitcoin/rust-bitcoin/compare/bitcoin-units-0.1.100...bitcoin-units-0.1.101
+[0.1.100]: https://github.com/rust-bitcoin/rust-bitcoin/compare/bitcoin-units-0.1.4...bitcoin-units-0.1.100
+[0.1.4]: https://github.com/rust-bitcoin/rust-bitcoin/compare/units-0.1.3...bitcoin-units-0.1.4
+[0.1.3]: https://github.com/rust-bitcoin/rust-bitcoin/compare/units-0.1.2...units-0.1.3
+[0.1.2]: https://github.com/rust-bitcoin/rust-bitcoin/compare/units-0.1.1...units-0.1.2
+[0.1.1]: https://github.com/rust-bitcoin/rust-bitcoin/compare/units-0.1.0...units-0.1.1
