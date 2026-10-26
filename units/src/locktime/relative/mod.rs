@@ -429,7 +429,7 @@ impl NumberOfBlocks {
     #[inline]
     pub const fn from_count(blocks: u16) -> Self { Self(blocks) }
 
-    /// Expresses the [`NumberOfBlocks`] as a count of blocks.
+    /// Express the [`NumberOfBlocks`] as a count of blocks.
     #[inline]
     #[must_use]
     pub const fn to_count(self) -> u16 { self.0 }
@@ -544,7 +544,7 @@ impl NumberOf512Seconds {
     #[inline]
     pub const fn from_512_second_intervals(intervals: u16) -> Self { Self(intervals) }
 
-    /// Expresses the [`NumberOf512Seconds`] as an integer number of 512-second intervals.
+    /// Express the [`NumberOf512Seconds`] as an integer number of 512-second intervals.
     #[inline]
     #[must_use]
     pub const fn to_512_second_intervals(self) -> u16 { self.0 }

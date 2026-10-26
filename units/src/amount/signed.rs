@@ -145,7 +145,7 @@ impl SignedAmount {
         }
     }
 
-    /// Constructs a [`SignedAmount`] value from a `u64` satoshi value.
+    /// Construct a [`SignedAmount`] value from a `u64` satoshi value.
     ///
     /// # Errors
     ///
