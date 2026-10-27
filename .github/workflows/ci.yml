@@ -1,0 +1,204 @@
+name: ci
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  tests:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fixpoint
+        uses: ./.github/actions/install-fixpoint
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Z3
+        uses: cda-tum/setup-z3@v1.6.6
+        with:
+          version: 4.15.3
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2.8.0
+        with:
+          cache-bin: false
+
+      - name: Run tests
+        run: |
+          cargo xtask test --fixpoint-timeout 10
+
+  vtock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fixpoint
+        uses: ./.github/actions/install-fixpoint
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Older versions hang
+      - name: Install Z3
+        uses: cda-tum/setup-z3@v1.6.6
+        with:
+          version: 4.15.3
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2.8.0
+
+      - name: Install Flux
+        run: |
+          cargo x install
+          echo ~/.cargo/bin >> $GITHUB_PATH
+
+      - name: Clone vtock
+        run: |
+          git clone https://github.com/PLSysSec/tock
+          cp rust-toolchain.toml tock/rust-toolchain.toml
+
+      - name: Patch flux-rs dependency if in pull request
+        if: github.event_name == 'pull_request'
+        run: |
+          echo '[patch."https://github.com/flux-rs/flux.git"]' >> tock/Cargo.toml
+          echo 'flux-rs = { path = "../lib/flux-rs" }' >> tock/Cargo.toml
+          echo 'flux-core = { path = "../lib/flux-core" }' >> tock/Cargo.toml
+          echo 'flux-alloc = { path = "../lib/flux-alloc" }' >> tock/Cargo.toml
+
+      - name: Check tock/kernel
+        run: |
+          cd tock
+          cargo flux -p cortexm -p rv32i
+
+  lean-demo:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lean via elan
+        run: |
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
+          echo "$HOME/.elan/bin" >> $GITHUB_PATH
+
+      - name: Install fixpoint
+        uses: ./.github/actions/install-fixpoint
+        env:
+          GITHUB_TOKEN:
+            ${{ secrets.GITHUB_TOKEN }}
+
+            # Older versions hang
+      - name: Install Z3
+        uses: cda-tum/setup-z3@v1.6.6
+        with:
+          version: 4.15.3
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2.8.0
+
+      - name: Install Flux
+        run: |
+          cargo x install
+          echo ~/.cargo/bin >> $GITHUB_PATH
+
+      - name: Clone flux-to-lean-demo
+        run: |
+          git clone https://github.com/flux-rs/flux-to-lean-demo
+
+      - name: Patch flux-rs dependency if in pull request
+        if: github.event_name == 'pull_request'
+        run: |
+          echo '[patch."https://github.com/flux-rs/flux.git"]' >> flux-to-lean-demo/Cargo.toml
+          echo 'flux-rs = { path = "../lib/flux-rs" }' >> flux-to-lean-demo/Cargo.toml
+          echo 'flux-core = { path = "../lib/flux-core" }' >> flux-to-lean-demo/Cargo.toml
+          echo 'flux-alloc = { path = "../lib/flux-alloc" }' >> flux-to-lean-demo/Cargo.toml
+
+      - name: Run lean demo
+        working-directory: flux-to-lean-demo
+        run: |
+          bash runlean.sh
+
+  rustfmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2.8.0
+
+      - name: Rust rustfmt
+        run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2.8.0
+
+      - name: Run cargo check
+        run: RUSTFLAGS="-Dwarnings" cargo check
+
+      - name: Run clippy
+        run: cargo clippy
+
+  deploy:
+    # Must match the glibc version on goto.ucsd.edu (glibc 2.35 / Ubuntu 22.04).
+    # Binaries compiled against a newer glibc will fail to run on the server.
+    runs-on: ubuntu-22.04
+    needs: [tests]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: playground
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2.8.0
+        with:
+          cache-bin: false
+
+      - name: Build and install flux sysroot
+        run: cargo x install
+
+      - name: Copy flux binary into sysroot directory
+        run: cp ~/.cargo/bin/flux ~/.flux/flux
+
+      - name: Stamp build with commit timestamp and toolchain info
+        run: |
+          git log -1 --format='%ct' > ~/.flux/version
+          # use sed to parse toml because `tomllib` needs Python 3.11+, which ubuntu-22.04
+          # doesn't ship. Assumes channel and components are each on a single line.
+          sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+            rust-toolchain.toml > ~/.flux/toolchain-channel
+          components=$(sed -n 's/^[[:space:]]*components[[:space:]]*=[[:space:]]*\[\(.*\)\].*/\1/p' rust-toolchain.toml | tr -d '",')
+          echo $components > ~/.flux/toolchain-components
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.FLUX_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan goto.ucsd.edu >> ~/.ssh/known_hosts
+
+      - name: Rsync flux sysroot to per-commit staging directory on server
+        run: |
+          SHA=$(git rev-parse HEAD)
+          # Destination is relative: rrsync (the forced command on the server)
+          # roots it under ~/.flux-staging, so this lands in ~/.flux-staging/$SHA.
+          rsync -az --delete ~/.flux/ nlehmann@goto.ucsd.edu:$SHA/
+
+      - name: Atomically swap sysroot on server
+        run: |
+          SHA=$(git rev-parse HEAD)
+          ssh nlehmann@goto.ucsd.edu "flux-deploy $SHA"

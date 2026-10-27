@@ -1,0 +1,37 @@
+name: gh-pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and Deploy Website
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install mdBook
+        uses: peaceiris/actions-mdbook@v1.2.0
+        with:
+          mdbook-version: "0.4.48"
+
+      - run: mdbook build book
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2.8.0
+
+      - run: cargo xtask doc && mv target/doc book/book
+
+      # Only deploy when pushing on main, otherwise just run mdbook and cargo doc to check if there are any errors
+      - uses: JamesIves/github-pages-deploy-action@4.1.7
+        if: ${{ github.event_name == 'push' }}
+        with:
+          branch: gh-pages # The branch the action should deploy to.
+          folder: book/book # The folder the action should deploy.
